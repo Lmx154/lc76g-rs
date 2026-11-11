@@ -459,8 +459,9 @@ fn decodes_proprietary_replies() {
 
 #[test]
 fn undecoded_and_malformed_sentences() {
-    assert_eq!(parse(SPEC_ZDA), Message::Other);
-    assert_eq!(parse(SPEC_GNS), Message::Other);
+    assert!(matches!(parse(SPEC_ZDA), Message::Zda(_)));
+    assert!(matches!(parse(SPEC_GNS), Message::Gns(_)));
+    assert_eq!(parse_body("GNRLM,1,2"), Message::Other);
     assert_eq!(parse_body("PAIR010,0,0,2044,369413"), Message::Other);
     assert_eq!(
         parse_body("GNGGA,040143.000,3149.334166"),

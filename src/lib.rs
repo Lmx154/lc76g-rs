@@ -56,6 +56,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
+pub mod aux_sentences;
 pub mod blocking;
 pub mod command;
 pub mod config;
@@ -350,5 +351,7 @@ impl<UART: Read + Write> Lc76g<UART> {
     }
 }
 
+#[cfg(test)]
+mod aux_tests;
 #[cfg(test)]
 mod tests;

@@ -4,6 +4,7 @@
 //! 0.01 degree, DOP and HDOP x100. A field the module leaves empty (no fix) decodes to `None`.
 //! Conversions to floating point are separate functions in [`crate::units`].
 
+use crate::aux_sentences::{self, Gns, Grs, Gst, Zda};
 use crate::field::{self, Bad, Parsed};
 use crate::nmea::Sentence;
 
@@ -129,7 +130,7 @@ pub enum PositionMode {
 }
 
 impl PositionMode {
-    fn parse(s: &str) -> Parsed<Option<Self>> {
+    pub(crate) fn parse(s: &str) -> Parsed<Option<Self>> {
         Ok(Some(match s {
             "" => return Ok(None),
             "A" => Self::Autonomous,
@@ -379,6 +380,14 @@ pub enum Message {
     Vtg(Vtg),
     /// GLL.
     Gll(Gll),
+    /// ZDA.
+    Zda(Zda),
+    /// GNS.
+    Gns(Gns),
+    /// GST.
+    Gst(Gst),
+    /// GRS.
+    Grs(Grs),
     /// PAIR001 acknowledgement.
     Ack(Ack),
     /// PQTMVERNO answer.
@@ -387,7 +396,7 @@ pub enum Message {
     Epe(Epe),
     /// PQTM OK/ERROR reply.
     PqtmReply(PqtmReply),
-    /// Valid sentence of a type this crate does not decode (ZDA, GNS, GST, GRS, other PAIR and PQTM).
+    /// Valid sentence of a type this crate does not decode (RLM, other PAIR and PQTM).
     Other,
     /// Valid checksum but the fields do not match the layout of the specification.
     Malformed,
@@ -432,6 +441,10 @@ fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
         "GSV" => gsv(talker, f),
         "VTG" => vtg(talker, f),
         "GLL" => gll(talker, f),
+        "ZDA" => aux_sentences::zda(talker, f),
+        "GNS" => aux_sentences::gns(talker, f),
+        "GST" => aux_sentences::gst(talker, f),
+        "GRS" => aux_sentences::grs(talker, f),
         _ => Ok(Message::Other),
     }
 }
