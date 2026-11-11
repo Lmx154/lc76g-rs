@@ -322,7 +322,10 @@ pub struct Version {
 impl Version {
     /// Version string, for example `LC76GABNR12A05S`.
     pub fn version(&self) -> &str {
-        core::str::from_utf8(&self.text[..usize::from(self.len)]).unwrap_or("")
+        self.text
+            .get(..usize::from(self.len))
+            .and_then(|bytes| core::str::from_utf8(bytes).ok())
+            .unwrap_or("")
     }
 }
 
@@ -419,10 +422,13 @@ pub(crate) fn decode(sentence: &Sentence<'_>) -> Message {
     let Ok(n) = collect_fields(sentence, &mut fields) else {
         return Message::Malformed;
     };
-    decode_fields(sentence.address(), &fields[..n]).unwrap_or(Message::Malformed)
+    let Some(used) = fields.get(..n) else {
+        return Message::Malformed;
+    };
+    decode_fields(sentence.address(), used).unwrap_or(Message::Malformed)
 }
 
-fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
+pub(crate) fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
     match address {
         "PAIR001" => return ack(f),
         "PQTMVERNO" => return version(f),
@@ -434,7 +440,7 @@ fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
     let (Some(talker), true) = (Talker::from_prefix(address), address.len() == 5) else {
         return Ok(Message::Other);
     };
-    match &address[2..] {
+    match address.get(2..).unwrap_or_default() {
         "GGA" => gga(talker, f),
         "RMC" => rmc(talker, f),
         "GSA" => gsa(talker, f),
@@ -447,6 +453,10 @@ fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
         "GRS" => aux_sentences::grs(talker, f),
         _ => Ok(Message::Other),
     }
+}
+
+fn at<'a>(f: &[&'a str], i: usize) -> Parsed<&'a str> {
+    f.get(i).copied().ok_or(Bad)
 }
 
 fn need(f: &[&str], n: usize) -> Parsed<()> {
@@ -463,17 +473,18 @@ fn status(s: &str) -> Parsed<bool> {
 
 fn gga(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 11)?;
-    let quality = field::uint_req::<u8>(f[5]).and_then(|c| Quality::from_code(c).ok_or(Bad))?;
+    let quality =
+        field::uint_req::<u8>(at(f, 5)?).and_then(|c| Quality::from_code(c).ok_or(Bad))?;
     Ok(Message::Gga(Gga {
         talker,
-        time: field::time(f[0])?,
-        lat_e7: field::latitude(f[1], f[2])?,
-        lon_e7: field::longitude(f[3], f[4])?,
+        time: field::time(at(f, 0)?)?,
+        lat_e7: field::latitude(at(f, 1)?, at(f, 2)?)?,
+        lon_e7: field::longitude(at(f, 3)?, at(f, 4)?)?,
         quality,
-        sats_used: field::uint(f[6])?,
-        hdop_x100: field::centi_u16(f[7])?,
-        alt_mm: field::metres_mm(f[8])?,
-        geoid_sep_mm: field::metres_mm(f[10])?,
+        sats_used: field::uint(at(f, 6)?)?,
+        hdop_x100: field::centi_u16(at(f, 7)?)?,
+        alt_mm: field::metres_mm(at(f, 8)?)?,
+        geoid_sep_mm: field::metres_mm(at(f, 10)?)?,
     }))
 }
 
@@ -481,13 +492,13 @@ fn rmc(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 9)?;
     Ok(Message::Rmc(Rmc {
         talker,
-        time: field::time(f[0])?,
-        valid: status(f[1])?,
-        lat_e7: field::latitude(f[2], f[3])?,
-        lon_e7: field::longitude(f[4], f[5])?,
-        speed_mm_s: field::knots_mm_s(f[6])?,
-        course_cdeg: field::course_cdeg(f[7])?,
-        date: field::date(f[8])?,
+        time: field::time(at(f, 0)?)?,
+        valid: status(at(f, 1)?)?,
+        lat_e7: field::latitude(at(f, 2)?, at(f, 3)?)?,
+        lon_e7: field::longitude(at(f, 4)?, at(f, 5)?)?,
+        speed_mm_s: field::knots_mm_s(at(f, 6)?)?,
+        course_cdeg: field::course_cdeg(at(f, 7)?)?,
+        date: field::date(at(f, 8)?)?,
         mode: PositionMode::parse(f.get(11).copied().unwrap_or(""))?,
         nav_status: match f.get(12).copied().unwrap_or("").as_bytes() {
             [] => None,
@@ -499,19 +510,19 @@ fn rmc(talker: Talker, f: &[&str]) -> Parsed<Message> {
 
 fn gsa(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 17)?;
-    let automatic = match f[0] {
+    let automatic = match at(f, 0)? {
         "A" => true,
         "M" => false,
         _ => return Err(Bad),
     };
-    let fix_type = match field::uint_req::<u8>(f[1])? {
+    let fix_type = match field::uint_req::<u8>(at(f, 1)?)? {
         1 => FixType::NoFix,
         2 => FixType::Fix2d,
         3 => FixType::Fix3d,
         _ => return Err(Bad),
     };
     let mut sats = [None; 12];
-    for (slot, s) in sats.iter_mut().zip(&f[2..14]) {
+    for (slot, s) in sats.iter_mut().zip(f.get(2..14).ok_or(Bad)?) {
         *slot = field::uint(s)?;
     }
     Ok(Message::Gsa(Gsa {
@@ -519,45 +530,48 @@ fn gsa(talker: Talker, f: &[&str]) -> Parsed<Message> {
         automatic,
         fix_type,
         sats,
-        pdop_x100: field::centi_u16(f[14])?,
-        hdop_x100: field::centi_u16(f[15])?,
-        vdop_x100: field::centi_u16(f[16])?,
+        pdop_x100: field::centi_u16(at(f, 14)?)?,
+        hdop_x100: field::centi_u16(at(f, 15)?)?,
+        vdop_x100: field::centi_u16(at(f, 16)?)?,
         system_id: field::uint(f.get(17).copied().unwrap_or(""))?,
     }))
 }
 
 fn gsv(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 3)?;
-    let rest = &f[3..];
+    let rest = f.get(3..).ok_or(Bad)?;
     let (blocks, signal_id) = match rest.len() % 4 {
         0 => (rest, None),
-        1 => (&rest[..rest.len() - 1], field::uint(rest[rest.len() - 1])?),
+        1 => {
+            let (last, blocks) = rest.split_last().ok_or(Bad)?;
+            (blocks, field::uint(last)?)
+        }
         _ => return Err(Bad),
     };
     if blocks.len() > 16 {
         return Err(Bad);
     }
     let mut sats = [None; 4];
-    for (slot, b) in sats.iter_mut().zip(blocks.as_chunks::<4>().0) {
+    for (slot, [id, elevation, azimuth, cn0]) in sats.iter_mut().zip(blocks.as_chunks::<4>().0) {
         *slot = match (
-            field::uint::<u16>(b[0])?,
-            b[1..].iter().all(|s| s.is_empty()),
+            field::uint::<u16>(id)?,
+            [elevation, azimuth, cn0].iter().all(|s| s.is_empty()),
         ) {
             (None, true) => None,
             (None, false) => return Err(Bad),
             (Some(id), _) => Some(SatInfo {
                 id,
-                elevation: field::uint(b[1])?,
-                azimuth: field::uint(b[2])?,
-                cn0: field::uint(b[3])?,
+                elevation: field::uint(elevation)?,
+                azimuth: field::uint(azimuth)?,
+                cn0: field::uint(cn0)?,
             }),
         };
     }
     Ok(Message::Gsv(Gsv {
         talker,
-        total_sentences: field::uint_req(f[0])?,
-        sentence: field::uint_req(f[1])?,
-        sats_in_view: field::uint_req(f[2])?,
+        total_sentences: field::uint_req(at(f, 0)?)?,
+        sentence: field::uint_req(at(f, 1)?)?,
+        sats_in_view: field::uint_req(at(f, 2)?)?,
         sats,
         signal_id,
     }))
@@ -565,13 +579,13 @@ fn gsv(talker: Talker, f: &[&str]) -> Parsed<Message> {
 
 fn vtg(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 8)?;
-    let speed_mm_s = match field::kmh_mm_s(f[6])? {
+    let speed_mm_s = match field::kmh_mm_s(at(f, 6)?)? {
         Some(v) => Some(v),
-        None => field::knots_mm_s(f[4])?,
+        None => field::knots_mm_s(at(f, 4)?)?,
     };
     Ok(Message::Vtg(Vtg {
         talker,
-        course_cdeg: field::course_cdeg(f[0])?,
+        course_cdeg: field::course_cdeg(at(f, 0)?)?,
         speed_mm_s,
         mode: PositionMode::parse(f.get(8).copied().unwrap_or(""))?,
     }))
@@ -581,10 +595,10 @@ fn gll(talker: Talker, f: &[&str]) -> Parsed<Message> {
     need(f, 6)?;
     Ok(Message::Gll(Gll {
         talker,
-        lat_e7: field::latitude(f[0], f[1])?,
-        lon_e7: field::longitude(f[2], f[3])?,
-        time: field::time(f[4])?,
-        valid: status(f[5])?,
+        lat_e7: field::latitude(at(f, 0)?, at(f, 1)?)?,
+        lon_e7: field::longitude(at(f, 2)?, at(f, 3)?)?,
+        time: field::time(at(f, 4)?)?,
+        valid: status(at(f, 5)?)?,
         mode: PositionMode::parse(f.get(6).copied().unwrap_or(""))?,
     }))
 }
@@ -592,8 +606,8 @@ fn gll(talker: Talker, f: &[&str]) -> Parsed<Message> {
 fn ack(f: &[&str]) -> Parsed<Message> {
     need(f, 2)?;
     Ok(Message::Ack(Ack {
-        command: field::uint_req(f[0])?,
-        result: field::uint_req(f[1])?,
+        command: field::uint_req(at(f, 0)?)?,
+        result: field::uint_req(at(f, 1)?)?,
     }))
 }
 
@@ -631,18 +645,18 @@ fn version(f: &[&str]) -> Parsed<Message> {
         return Ok(m);
     }
     need(f, 3)?;
-    let name = f[0].as_bytes();
+    let name = at(f, 0)?.as_bytes();
     if name.is_empty() || name.len() > VERSION_LEN || !name.is_ascii() {
         return Err(Bad);
     }
     let mut text = [0; VERSION_LEN];
-    text[..name.len()].copy_from_slice(name);
-    let mut date = f[1].split('/');
+    text.get_mut(..name.len()).ok_or(Bad)?.copy_from_slice(name);
+    let mut date = at(f, 1)?.split('/');
     let (Some(y), Some(m), Some(d), None) = (date.next(), date.next(), date.next(), date.next())
     else {
         return Err(Bad);
     };
-    let mut time = f[2].split(':');
+    let mut time = at(f, 2)?.split(':');
     let (Some(h), Some(mi), Some(s), None) = (time.next(), time.next(), time.next(), time.next())
     else {
         return Err(Bad);
@@ -666,14 +680,14 @@ fn version(f: &[&str]) -> Parsed<Message> {
 
 fn epe(f: &[&str]) -> Parsed<Message> {
     need(f, 6)?;
-    if f[0] != "2" {
+    if at(f, 0)? != "2" {
         return Ok(Message::Other);
     }
     Ok(Message::Epe(Epe {
-        north_mm: field::scaled(f[1], 1000, 1)?,
-        east_mm: field::scaled(f[2], 1000, 1)?,
-        down_mm: field::scaled(f[3], 1000, 1)?,
-        epe_2d_mm: field::scaled(f[4], 1000, 1)?,
-        epe_3d_mm: field::scaled(f[5], 1000, 1)?,
+        north_mm: field::scaled(at(f, 1)?, 1000, 1)?,
+        east_mm: field::scaled(at(f, 2)?, 1000, 1)?,
+        down_mm: field::scaled(at(f, 3)?, 1000, 1)?,
+        epe_2d_mm: field::scaled(at(f, 4)?, 1000, 1)?,
+        epe_3d_mm: field::scaled(at(f, 5)?, 1000, 1)?,
     }))
 }

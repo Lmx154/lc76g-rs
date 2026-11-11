@@ -184,10 +184,10 @@ impl Command<'_> {
                 out.str(body)?;
             }
         }
-        let sum = checksum(&out.buf[1..out.len]);
+        let sum = checksum(out.buf.get(1..out.len)?);
         out.byte(b'*')?;
-        out.byte(HEX[usize::from(sum >> 4)])?;
-        out.byte(HEX[usize::from(sum & 15)])?;
+        out.byte(*HEX.get(usize::from(sum >> 4))?)?;
+        out.byte(*HEX.get(usize::from(sum & 15))?)?;
         out.str("\r\n")?;
         Some(out.len)
     }
@@ -198,11 +198,11 @@ const HEX: &[u8; 16] = b"0123456789ABCDEF";
 fn raw_reply(body: &str) -> Option<CommandId> {
     let b = body.as_bytes();
     if let Some(id) = b.strip_prefix(b"PAIR")
-        && id.len() >= 3
-        && id[..3].iter().all(u8::is_ascii_digit)
-        && id.get(3).is_none_or(|c| *c == b',')
+        && let Some((digits, tail)) = id.split_first_chunk::<3>()
+        && digits.iter().all(u8::is_ascii_digit)
+        && tail.first().is_none_or(|c| *c == b',')
     {
-        let id = id[..3]
+        let id = digits
             .iter()
             .fold(0u16, |acc, d| acc * 10 + u16::from(d - b'0'));
         return Some(CommandId::Pair(id));
@@ -240,16 +240,15 @@ impl Out<'_> {
         let mut n = 0;
         let mut v = v;
         loop {
-            digits[n] = b'0' + (v % 10) as u8;
+            *digits.get_mut(n)? = b'0' + (v % 10) as u8;
             n += 1;
             v /= 10;
             if v == 0 {
                 break;
             }
         }
-        while n > 0 {
-            n -= 1;
-            self.byte(digits[n])?;
+        for digit in digits.get(..n)?.iter().rev() {
+            self.byte(*digit)?;
         }
         Some(())
     }

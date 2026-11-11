@@ -22,8 +22,8 @@ pub(crate) struct Decimal {
 impl Decimal {
     pub(crate) fn parse(s: &str) -> Option<Self> {
         let (neg, digits) = match s.as_bytes().first()? {
-            b'-' => (true, &s[1..]),
-            b'+' => (false, &s[1..]),
+            b'-' => (true, s.get(1..)?),
+            b'+' => (false, s.get(1..)?),
             _ => (false, s),
         };
         let (int, frac) = digits.split_once('.').unwrap_or((digits, ""));
@@ -167,8 +167,8 @@ fn coordinate(
     if int.len() != deg_digits + 2 || frac.len() > 9 {
         return Err(Bad);
     }
-    let deg = digits_value(&int[..deg_digits]).ok_or(Bad)?;
-    let min = digits_value(&int[deg_digits..]).ok_or(Bad)?;
+    let deg = int.get(..deg_digits).and_then(digits_value).ok_or(Bad)?;
+    let min = int.get(deg_digits..).and_then(digits_value).ok_or(Bad)?;
     let frac_value = digits_value(frac).ok_or(Bad)?;
     if min >= 60 || deg > max_deg || (deg == max_deg && (min != 0 || frac_value != 0)) {
         return Err(Bad);
@@ -201,9 +201,9 @@ pub(crate) fn time(s: &str) -> Parsed<Option<Time>> {
         if int.len() != 6 || frac.len() > 9 {
             return None;
         }
-        let hour = digits_value(&int[0..2])?;
-        let minute = digits_value(&int[2..4])?;
-        let second = digits_value(&int[4..6])?;
+        let hour = digits_value(int.get(0..2)?)?;
+        let minute = digits_value(int.get(2..4)?)?;
+        let second = digits_value(int.get(4..6)?)?;
         let mut millis = digits_value(frac.get(..frac.len().min(3))?)?;
         for _ in frac.len().min(3)..3 {
             millis *= 10;
@@ -227,9 +227,9 @@ pub(crate) fn date(s: &str) -> Parsed<Option<Date>> {
         if s.len() != 6 {
             return None;
         }
-        let day = digits_value(&s[0..2])?;
-        let month = digits_value(&s[2..4])?;
-        let year = digits_value(&s[4..6])?;
+        let day = digits_value(s.get(0..2)?)?;
+        let month = digits_value(s.get(2..4)?)?;
+        let year = digits_value(s.get(4..6)?)?;
         if !(1..=31).contains(&day) || !(1..=12).contains(&month) {
             return None;
         }

@@ -55,6 +55,19 @@
 //! ```
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
+#![cfg_attr(
+    not(test),
+    deny(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::unreachable,
+        clippy::todo,
+        clippy::unimplemented,
+        clippy::indexing_slicing,
+        clippy::undocumented_unsafe_blocks
+    )
+)]
 
 pub mod aux_sentences;
 pub mod blocking;
@@ -198,7 +211,9 @@ impl<UART: Read> Lc76g<UART> {
     async fn next_sentence(&mut self) -> Result<Sentence<'_>, Error<UART::Error>> {
         loop {
             while self.pos < self.end {
-                let byte = self.rx[self.pos];
+                let Some(&byte) = self.rx.get(self.pos) else {
+                    break;
+                };
                 self.pos += 1;
                 if self.framer.advance(byte) {
                     return Ok(self.framer.ready());
@@ -313,11 +328,11 @@ impl<UART: Read + Write> Lc76g<UART> {
     async fn send(&mut self, command: &Command<'_>) -> Result<(), Error<UART::Error>> {
         let mut buf = [0u8; MAX_COMMAND_LEN];
         let len = command.write(&mut buf).ok_or(Error::InvalidCommand)?;
-        let mut rest = &buf[..len];
+        let mut rest = buf.get(..len).ok_or(Error::InvalidCommand)?;
         while !rest.is_empty() {
             match self.uart.write(rest).await.map_err(Error::Uart)? {
                 0 => return Err(Error::Eof),
-                n => rest = &rest[n..],
+                n => rest = rest.get(n..).unwrap_or_default(),
             }
         }
         self.uart.flush().await.map_err(Error::Uart)
@@ -353,5 +368,7 @@ impl<UART: Read + Write> Lc76g<UART> {
 
 #[cfg(test)]
 mod aux_tests;
+#[cfg(test)]
+mod fuzz_tests;
 #[cfg(test)]
 mod tests;

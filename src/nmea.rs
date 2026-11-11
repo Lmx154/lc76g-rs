@@ -28,15 +28,14 @@ fn hex(b: u8) -> Option<u8> {
 
 /// True when `text` is `$` + printable ASCII + `*` + two hex digits with a matching checksum.
 fn is_valid(text: &[u8]) -> bool {
-    let n = text.len();
-    if n < 4 || text[0] != b'$' || text[n - 3] != b'*' {
+    let [b'$', body @ .., b'*', high, low] = text else {
         return false;
-    }
+    };
     if !text.iter().all(|b| (0x20..0x7F).contains(b)) {
         return false;
     }
-    match (hex(text[n - 2]), hex(text[n - 1])) {
-        (Some(hi), Some(lo)) => checksum(&text[1..n - 3]) == (hi << 4 | lo),
+    match (hex(*high), hex(*low)) {
+        (Some(hi), Some(lo)) => checksum(body) == (hi << 4 | lo),
         _ => false,
     }
 }
@@ -112,7 +111,9 @@ impl Framer {
                 if state == State::Body {
                     self.stats.checksum_errors = self.stats.checksum_errors.saturating_add(1);
                 }
-                self.buf[0] = b'$';
+                if let Some(slot) = self.buf.first_mut() {
+                    *slot = b'$';
+                }
                 self.len = 1;
                 self.state = State::Body;
                 false
@@ -125,7 +126,7 @@ impl Framer {
             (State::Skip, _) => false,
             (State::Body, b'\r' | b'\n') => {
                 self.state = State::Idle;
-                if is_valid(&self.buf[..self.len]) {
+                if is_valid(self.buf.get(..self.len).unwrap_or(&[])) {
                     self.stats.sentences = self.stats.sentences.saturating_add(1);
                     true
                 } else {
@@ -134,12 +135,12 @@ impl Framer {
                 }
             }
             (State::Body, _) => {
-                if self.len == MAX_SENTENCE_LEN {
+                if let Some(slot) = self.buf.get_mut(self.len) {
+                    *slot = byte;
+                    self.len += 1;
+                } else {
                     self.stats.overflows = self.stats.overflows.saturating_add(1);
                     self.state = State::Skip;
-                } else {
-                    self.buf[self.len] = byte;
-                    self.len += 1;
                 }
                 false
             }
@@ -149,7 +150,11 @@ impl Framer {
     /// The sentence completed by the last [`Framer::advance`] that returned true.
     pub(crate) fn ready(&self) -> Sentence<'_> {
         Sentence {
-            text: core::str::from_utf8(&self.buf[..self.len]).unwrap_or(""),
+            text: self
+                .buf
+                .get(..self.len)
+                .and_then(|bytes| core::str::from_utf8(bytes).ok())
+                .unwrap_or(""),
         }
     }
 }
@@ -191,7 +196,9 @@ impl<'a> Sentence<'a> {
 
     /// Characters between `$` and `*`.
     fn body(&self) -> &'a str {
-        &self.text[1..self.text.len() - 3]
+        self.text
+            .get(1..self.text.len().saturating_sub(3))
+            .unwrap_or("")
     }
 
     /// Address field: talker and formatter (`"GNGGA"`) or proprietary name (`"PAIR001"`,
