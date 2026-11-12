@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::future::{Future, poll_fn};
 use std::pin::pin;
@@ -1244,4 +1244,380 @@ fn blocking_driver_runs_the_same_code() {
     assert_eq!(gnss.read(), Err(Error::Eof));
     assert_eq!(gnss.stats().fixes, 1);
     let _ = gnss.release();
+}
+
+// ---- resynchronisation after an abandoned exchange ----
+
+const NAV: Command<'static> = Command::SetNavMode(NavMode::Drone);
+
+/// A module that ignores damaged lines and, while `quiet`, stays silent on lines starting with `prefix`.
+fn module(quiet: Rc<Cell<bool>>, prefix: &'static str) -> impl FnMut(&str) -> Vec<u8> + 'static {
+    move |line| {
+        if Sentence::new(line).is_none() || (quiet.get() && line.starts_with(prefix)) {
+            Vec::new()
+        } else {
+            friendly(line)
+        }
+    }
+}
+
+fn poll_once<F: Future>(f: &mut std::pin::Pin<&mut F>) -> Poll<F::Output> {
+    f.as_mut().poll(&mut Context::from_waker(Waker::noop()))
+}
+
+/// Starts `command` against a silent line and drops the future when it first pends.
+fn abandon<U: Read + Write>(gnss: &mut Lc76g<U>, command: &Command<'_>) {
+    let mut f = pin!(gnss.command(command));
+    assert!(poll_once(&mut f).is_pending());
+}
+
+fn sent_lines(fake: &Fake) -> Vec<String> {
+    fake.written()
+        .into_iter()
+        .filter(|l| !l.is_empty())
+        .collect()
+}
+
+fn late(result: u8) -> Vec<u8> {
+    lines(&[&frame(&format!("PAIR001,080,{result}"))])
+}
+
+fn silent_fake(prefix: &'static str) -> (Fake, Rc<Cell<bool>>) {
+    let quiet = Rc::new(Cell::new(true));
+    let fake = Fake::default().responder(module(quiet.clone(), prefix));
+    fake.0.borrow_mut().pend_when_empty = true;
+    (fake, quiet)
+}
+
+/// A UART whose `stop`-th operation (read, write or flush) never completes.
+#[derive(Clone)]
+struct Gate {
+    inner: Fake,
+    ops: Rc<Cell<usize>>,
+    stop: Rc<Cell<usize>>,
+}
+impl Gate {
+    async fn step(&self) {
+        poll_fn(|_| {
+            self.ops.set(self.ops.get() + 1);
+            if self.ops.get() == self.stop.get() {
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await
+    }
+}
+impl embedded_io::ErrorType for Gate {
+    type Error = ErrorKind;
+}
+impl embedded_io_async::Read for Gate {
+    async fn read(&mut self, buf: &mut [u8]) -> Result<usize, ErrorKind> {
+        self.step().await;
+        self.inner.read(buf).await
+    }
+}
+impl embedded_io_async::Write for Gate {
+    async fn write(&mut self, buf: &[u8]) -> Result<usize, ErrorKind> {
+        self.step().await;
+        self.inner.write(buf).await
+    }
+    async fn flush(&mut self) -> Result<(), ErrorKind> {
+        self.step().await;
+        self.inner.flush().await
+    }
+}
+
+#[test]
+fn stale_ack_after_a_dropped_exchange_is_not_taken_for_the_next_one() {
+    let (fake, quiet) = silent_fake("$PAIR080");
+    let mut gnss = Lc76g::new(fake.clone());
+    abandon(&mut gnss, &NAV);
+    quiet.set(false);
+    fake.feed(&late(4));
+    assert_eq!(run(gnss.command(&NAV)), Ok(()));
+}
+
+#[test]
+fn stale_ack_after_a_no_ack_exchange_is_not_taken_for_the_next_one() {
+    let quiet = Rc::new(Cell::new(true));
+    let q = quiet.clone();
+    let fake = Fake::default().responder(move |line| {
+        if q.get() {
+            lines(&[SPEC_VTG; ACK_SENTENCE_LIMIT + 1])
+        } else {
+            friendly(line)
+        }
+    });
+    let mut gnss = Lc76g::new(fake.clone());
+    assert_eq!(run(gnss.command(&NAV)), Err(Error::NoAck));
+    quiet.set(false);
+    fake.feed(&late(4));
+    assert_eq!(run(gnss.command(&NAV)), Ok(()));
+}
+
+#[test]
+fn a_drop_at_every_await_point_is_followed_by_a_correct_command() {
+    for write_limit in [None, Some(4)] {
+        let mut swept = 0;
+        for k in 1.. {
+            let (fake, quiet) = silent_fake("$PAIR080");
+            fake.0.borrow_mut().write_limit = write_limit;
+            let gate = Gate {
+                inner: fake.clone(),
+                ops: Rc::new(Cell::new(0)),
+                stop: Rc::new(Cell::new(k)),
+            };
+            let mut gnss = Lc76g::new(gate.clone());
+            {
+                let mut f = pin!(gnss.command(&NAV));
+                assert_eq!(poll_once(&mut f), Poll::Pending);
+                if gate.ops.get() < k {
+                    break;
+                }
+            }
+            swept += 1;
+            gate.stop.set(usize::MAX);
+            quiet.set(false);
+            fake.feed(&late(4));
+            assert_eq!(
+                run(gnss.command(&NAV)),
+                Ok(()),
+                "{write_limit:?} drop at {k}"
+            );
+            assert_eq!(fake.written().last().unwrap(), "$PAIR080,5*2B");
+        }
+        assert!(swept >= 3, "{swept}");
+    }
+}
+
+#[test]
+fn a_command_dropped_part_way_through_its_write_is_followed_by_a_clean_query() {
+    let (fake, quiet) = silent_fake("$PAIR080");
+    fake.0.borrow_mut().write_limit = Some(8);
+    let gate = Gate {
+        inner: fake.clone(),
+        ops: Rc::new(Cell::new(0)),
+        stop: Rc::new(Cell::new(2)),
+    };
+    let mut gnss = Lc76g::new(gate.clone());
+    {
+        let mut f = pin!(gnss.command(&NAV));
+        assert_eq!(poll_once(&mut f), Poll::Pending);
+    }
+    gate.stop.set(usize::MAX);
+    assert_eq!(fake.0.borrow().tx, b"$PAIR080,5*2B\r\n"[..8]);
+    quiet.set(false);
+    assert_eq!(run(gnss.command(&NAV)), Ok(()));
+    let tx = String::from_utf8(fake.0.borrow().tx.clone()).unwrap();
+    let query = format!("{}\r\n", frame("PAIR051"));
+    assert_eq!(tx, format!("$PAIR080\r\n{query}$PAIR080,5*2B\r\n"));
+    let written = fake.written();
+    assert_eq!(written[0], "$PAIR080");
+    assert!(Sentence::new(&written[1]).is_some());
+}
+
+#[test]
+fn uninterrupted_exchanges_send_exactly_the_command_bytes() {
+    let fake = Fake::default().responder(|line| {
+        if line.starts_with("$PAIR062") {
+            lines(&[&frame("PAIR001,062,4")])
+        } else {
+            friendly(line)
+        }
+    });
+    let mut gnss = Lc76g::new(fake.clone());
+    let rate = Command::SetSentenceRate {
+        sentence: SentenceType::Gga,
+        rate: 3,
+    };
+    run(gnss.version()).unwrap();
+    run(gnss.command(&NAV)).unwrap();
+    assert!(matches!(
+        run(gnss.command(&rate)),
+        Err(Error::Rejected { .. })
+    ));
+    run(gnss.command(&Command::Raw("PMTK000"))).unwrap();
+    assert_eq!(
+        run(gnss.command(&Command::Raw("A*B"))),
+        Err(Error::InvalidCommand)
+    );
+    run(gnss.command(&Command::SetEpe(true))).unwrap();
+    let expected: String = [
+        Command::QueryVersion,
+        NAV,
+        rate,
+        Command::Raw("PMTK000"),
+        Command::SetEpe(true),
+    ]
+    .into_iter()
+    .map(encode)
+    .collect();
+    assert_eq!(fake.0.borrow().tx, expected.as_bytes());
+}
+
+#[test]
+fn an_unanswered_resynchronisation_gives_no_ack_and_is_tried_again() {
+    let quiet = Rc::new(Cell::new(true));
+    let queries = Rc::new(Cell::new(0));
+    let (q, n) = (quiet.clone(), queries.clone());
+    let fake = Fake::default().responder(move |line| {
+        if Sentence::new(line).is_none() || (q.get() && line.starts_with("$PAIR080")) {
+            Vec::new()
+        } else if line.starts_with("$PAIR051") {
+            n.set(n.get() + 1);
+            if n.get() == 1 {
+                lines(&[SPEC_VTG; ACK_SENTENCE_LIMIT + 1])
+            } else {
+                friendly(line)
+            }
+        } else {
+            friendly(line)
+        }
+    });
+    fake.0.borrow_mut().pend_when_empty = true;
+    let mut gnss = Lc76g::new(fake.clone());
+    abandon(&mut gnss, &NAV);
+    quiet.set(false);
+    assert_eq!(run(gnss.command(&NAV)), Err(Error::NoAck));
+    let sent = sent_lines(&fake);
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1], frame("PAIR051"));
+    assert_eq!(run(gnss.command(&NAV)), Ok(()));
+    let sent = sent_lines(&fake);
+    assert_eq!(queries.get(), 1);
+    assert_eq!(sent.len(), 4);
+    assert_eq!(sent[2], frame("PAIR081"));
+    assert_eq!(sent[3], "$PAIR080,5*2B");
+}
+
+#[test]
+fn the_query_differs_from_the_abandoned_and_the_new_command() {
+    let cases = [
+        (
+            Command::Raw("PAIR051"),
+            Command::Raw("PAIR081"),
+            "PQTMVERNO",
+        ),
+        (Command::QueryVersion, Command::Raw("PAIR051"), "PAIR081"),
+        (Command::Raw("PAIR081"), Command::QueryVersion, "PAIR051"),
+    ];
+    for (abandoned, next, query) in cases {
+        let (fake, quiet) = silent_fake("$");
+        let mut gnss = Lc76g::new(fake.clone());
+        abandon(&mut gnss, &abandoned);
+        quiet.set(false);
+        run(gnss.command(&next)).unwrap();
+        assert_eq!(sent_lines(&fake)[1], frame(query), "{abandoned:?} {next:?}");
+    }
+}
+
+#[test]
+fn an_unanswered_query_is_not_used_again_by_the_next_resynchronisation() {
+    for next in [NAV, Command::Raw("PMTK000")] {
+        let quiet_command = Rc::new(Cell::new(true));
+        let quiet_query = Rc::new(Cell::new(true));
+        let reject_get = Rc::new(Cell::new(false));
+        let (qc, qq, rg) = (
+            quiet_command.clone(),
+            quiet_query.clone(),
+            reject_get.clone(),
+        );
+        let fake = Fake::default().responder(move |line| {
+            if Sentence::new(line).is_none()
+                || (qc.get() && line.starts_with("$PAIR080"))
+                || (qq.get() && line.starts_with("$PAIR051"))
+            {
+                Vec::new()
+            } else if rg.get() && line.starts_with("$PAIR051") {
+                lines(&[&frame("PAIR001,051,4")])
+            } else {
+                friendly(line)
+            }
+        });
+        fake.0.borrow_mut().pend_when_empty = true;
+        let mut gnss = Lc76g::new(fake.clone());
+        abandon(&mut gnss, &NAV);
+        // the second call is cut short while it waits for the answer to its query
+        abandon(&mut gnss, &NAV);
+        assert_eq!(sent_lines(&fake).last().unwrap(), &frame("PAIR051"));
+        quiet_command.set(false);
+        quiet_query.set(false);
+        fake.feed(&[late(4), lines(&[&frame("PAIR001,051,0")])].concat());
+        assert_eq!(run(gnss.command(&next)), Ok(()));
+        assert_ne!(sent_lines(&fake)[2], frame("PAIR051"));
+        // nothing of the earlier queries is left to be taken for the answer to a later command
+        reject_get.set(true);
+        assert_eq!(
+            run(gnss.command(&Command::Raw("PAIR051"))),
+            Err(Error::Rejected {
+                command: CommandId::Pair(51),
+                code: 4
+            })
+        );
+    }
+}
+
+#[test]
+fn a_drop_inside_the_resynchronisation_is_followed_by_a_correct_command() {
+    let get_rejected = Rc::new(Cell::new(false));
+    for write_limit in [None, Some(4)] {
+        let mut swept = 0;
+        for k in 1.. {
+            let quiet = Rc::new(Cell::new(true));
+            let (q, g) = (quiet.clone(), get_rejected.clone());
+            let fake = Fake::default().responder(move |line| {
+                if Sentence::new(line).is_none() || (q.get() && line.starts_with("$PAIR080")) {
+                    Vec::new()
+                } else if g.get() && line.starts_with("$PAIR051") {
+                    lines(&[&frame("PAIR001,051,4")])
+                } else {
+                    friendly(line)
+                }
+            });
+            get_rejected.set(false);
+            {
+                let mut s = fake.0.borrow_mut();
+                s.pend_when_empty = true;
+                s.write_limit = write_limit;
+            }
+            let gate = Gate {
+                inner: fake.clone(),
+                ops: Rc::new(Cell::new(0)),
+                stop: Rc::new(Cell::new(usize::MAX)),
+            };
+            let mut gnss = Lc76g::new(gate.clone());
+            abandon(&mut gnss, &NAV);
+            quiet.set(false);
+            fake.feed(&late(4));
+            gate.ops.set(0);
+            gate.stop.set(k);
+            {
+                let mut f = pin!(gnss.command(&NAV));
+                if poll_once(&mut f).is_ready() {
+                    break;
+                }
+                assert!(gate.ops.get() >= k, "{write_limit:?} {k}");
+            }
+            swept += 1;
+            gate.stop.set(usize::MAX);
+            assert_eq!(
+                run(gnss.command(&NAV)),
+                Ok(()),
+                "{write_limit:?} drop at {k}"
+            );
+            assert_eq!(sent_lines(&fake).last().unwrap(), "$PAIR080,5*2B");
+            get_rejected.set(true);
+            assert_eq!(
+                run(gnss.command(&Command::Raw("PAIR051"))),
+                Err(Error::Rejected {
+                    command: CommandId::Pair(51),
+                    code: 4
+                }),
+                "{write_limit:?} drop at {k}"
+            );
+        }
+        assert!(swept >= 5, "{swept}");
+    }
 }

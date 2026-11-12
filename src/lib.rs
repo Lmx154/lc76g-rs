@@ -19,7 +19,13 @@
 //! driver a buffered UART (interrupt or DMA ring buffer): the module sends bursts of about 20
 //! sentences (1.4 kB, 120 ms at 115200 baud) that a UART with a one-byte FIFO would overrun. Dropping
 //! a `read*` or `command` future loses nothing the driver already read; a command write cut short may
-//! leave a partial sentence on the wire, which the module discards by its checksum.
+//! leave a partial sentence on the wire, which the module discards by its checksum. A `command` that was
+//! dropped, or ended in [`Error::NoAck`] or a UART error, leaves its acknowledgement possibly still to
+//! come: the next `command`, `version`, `init` or `save_settings` first sends a read-only query
+//! (`$PAIR051`, `$PAIR081` or `$PQTMVERNO`, never one of the two commands involved) and discards
+//! everything up to its answer, so a late acknowledgement is not taken for the answer to the next
+//! command; a query left unanswered is not used again by the next attempt. This assumes the module
+//! answers commands in the order it received them.
 //!
 //! Units: coordinates are `i32` in 1e-7 degree, altitude `i32` mm, speed `u32` mm/s, course `u16` in
 //! 0.01 degree, DOP `u16` x100. [`units`] converts to floating point.
@@ -102,6 +108,14 @@ const RX_CHUNK: usize = 64;
 /// five seconds at the default rate, without making a dead line hang for long.
 pub const ACK_SENTENCE_LIMIT: usize = 100;
 
+/// Read-only queries `resynchronise` chooses from: `$PAIR051` (get the fix interval), `$PAIR081` (get
+/// the navigation mode) and `$PQTMVERNO`. None changes a setting or writes the module's flash.
+const PROBES: [Command<'static>; 3] = [
+    Command::Raw("PAIR051"),
+    Command::Raw("PAIR081"),
+    Command::QueryVersion,
+];
+
 /// Driver errors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -157,6 +171,9 @@ pub struct Lc76g<UART> {
     held: Option<Fix>,
     fixes: u32,
     fixes_discarded: u32,
+    open: bool,
+    open_reply: Option<CommandId>,
+    unanswered: Option<CommandId>,
 }
 
 impl<UART> Lc76g<UART> {
@@ -172,6 +189,9 @@ impl<UART> Lc76g<UART> {
             held: None,
             fixes: 0,
             fixes_discarded: 0,
+            open: false,
+            open_reply: None,
+            unanswered: None,
         }
     }
 
@@ -267,8 +287,13 @@ impl<UART: Read + Write> Lc76g<UART> {
     ///
     /// Fixes that complete while waiting are discarded and counted in [`Stats::fixes_discarded`].
     /// Gives up after [`ACK_SENTENCE_LIMIT`] sentences; on a silent line it waits forever, see the
-    /// crate docs. A stale acknowledgement of the same command from an earlier, abandoned call is
-    /// accepted as the answer.
+    /// crate docs. If an earlier call was dropped or ended without reading its acknowledgement
+    /// ([`Error::NoAck`], [`Error::Uart`]), this call first resynchronises: it sends a read-only query
+    /// (one of `$PAIR051`, `$PAIR081`, `$PQTMVERNO`, not the abandoned command and not this one) and
+    /// discards sentences, at most [`ACK_SENTENCE_LIMIT`], up to its answer, so the late acknowledgement
+    /// of the earlier command is not taken as this one's. If the query gets no answer this returns
+    /// [`Error::NoAck`] without sending the command, and the next call tries again with another query
+    /// where it can. This assumes the module answers commands in the order it received them.
     pub async fn command(&mut self, command: &Command<'_>) -> Result<(), Error<UART::Error>> {
         self.exchange(command).await.map(|_| ())
     }
@@ -325,10 +350,24 @@ impl<UART: Read + Write> Lc76g<UART> {
         self.command(&Command::SavePqtm).await
     }
 
-    async fn send(&mut self, command: &Command<'_>) -> Result<(), Error<UART::Error>> {
-        let mut buf = [0u8; MAX_COMMAND_LEN];
-        let len = command.write(&mut buf).ok_or(Error::InvalidCommand)?;
-        let mut rest = buf.get(..len).ok_or(Error::InvalidCommand)?;
+    async fn send(
+        &mut self,
+        command: &Command<'_>,
+        line_end_first: bool,
+        mark_open: bool,
+    ) -> Result<(), Error<UART::Error>> {
+        let mut buf = [0u8; MAX_COMMAND_LEN + 2];
+        let (lead, body) = buf
+            .split_first_chunk_mut::<2>()
+            .ok_or(Error::InvalidCommand)?;
+        *lead = *b"\r\n";
+        let len = command.write(body).ok_or(Error::InvalidCommand)?;
+        let start = if line_end_first { 0 } else { 2 };
+        let mut rest = buf.get(start..len + 2).ok_or(Error::InvalidCommand)?;
+        if mark_open {
+            self.open = true;
+            self.open_reply = command.reply();
+        }
         while !rest.is_empty() {
             match self.uart.write(rest).await.map_err(Error::Uart)? {
                 0 => return Err(Error::Eof),
@@ -338,21 +377,14 @@ impl<UART: Read + Write> Lc76g<UART> {
         self.uart.flush().await.map_err(Error::Uart)
     }
 
-    async fn exchange(
-        &mut self,
-        command: &Command<'_>,
-    ) -> Result<Option<Message>, Error<UART::Error>> {
-        self.send(command).await?;
-        let Some(expected) = command.reply() else {
-            return Ok(None);
-        };
+    async fn wait_ack(&mut self, expected: CommandId) -> Result<Message, Error<UART::Error>> {
         for _ in 0..ACK_SENTENCE_LIMIT {
             let message = self.next_sentence().await?.parse();
             if self.ingest(&message).is_some() {
                 self.discard_fix();
             }
             match expected.outcome(&message) {
-                Outcome::Done => return Ok(Some(message)),
+                Outcome::Done => return Ok(message),
                 Outcome::Rejected(code) => {
                     return Err(Error::Rejected {
                         command: expected,
@@ -363,6 +395,56 @@ impl<UART: Read + Write> Lc76g<UART> {
             }
         }
         Err(Error::NoAck)
+    }
+
+    /// Sends a read-only query whose number differs from the abandoned command, the new command and
+    /// the query of an earlier resynchronisation that never completed, and discards everything up to
+    /// its answer, which the module gives after the acknowledgements of the earlier commands.
+    async fn resynchronise(&mut self, new: Option<CommandId>) -> Result<(), Error<UART::Error>> {
+        let abandoned = self.open_reply;
+        let pick = |unanswered: Option<CommandId>| {
+            PROBES.iter().find_map(|probe| {
+                let reply = probe.reply()?;
+                (Some(reply) != abandoned && Some(reply) != new && Some(reply) != unanswered)
+                    .then_some((probe, reply))
+            })
+        };
+        let (probe, expected) = pick(self.unanswered)
+            .or_else(|| pick(None))
+            .ok_or(Error::NoAck)?;
+        self.unanswered = Some(expected);
+        self.send(probe, true, false).await?;
+        match self.wait_ack(expected).await {
+            Ok(_) | Err(Error::Rejected { .. }) => {
+                self.open = false;
+                self.unanswered = None;
+                Ok(())
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn exchange(
+        &mut self,
+        command: &Command<'_>,
+    ) -> Result<Option<Message>, Error<UART::Error>> {
+        let expected = command.reply();
+        command
+            .write(&mut [0u8; MAX_COMMAND_LEN])
+            .ok_or(Error::InvalidCommand)?;
+        if self.open {
+            self.resynchronise(expected).await?;
+        }
+        self.send(command, false, true).await?;
+        let Some(expected) = expected else {
+            self.open = false;
+            return Ok(None);
+        };
+        let result = self.wait_ack(expected).await;
+        if matches!(result, Ok(_) | Err(Error::Rejected { .. })) {
+            self.open = false;
+        }
+        result.map(Some)
     }
 }
 
