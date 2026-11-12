@@ -24,6 +24,16 @@ use crate::sentence::{Date, Message, PositionMode, Talker, Time};
 /// GLONASS, Galileo, BDS, QZSS, NavIC).
 pub const GNS_MODE_SLOTS: usize = 6;
 
+/// Fields of a GNS sentence in the standard NMEA layout, which the module sends: no unit fields.
+const GNS_STANDARD_FIELDS: usize = 13;
+
+/// Fewest fields of a GNS sentence in the layout of the manufacturer's example (unit fields after the
+/// altitude and the geoid separation, no navigational status).
+const GNS_UNIT_FIELDS_MIN: usize = 14;
+
+/// Most fields of a GNS sentence in the layout of the manufacturer's example (with the status).
+const GNS_UNIT_FIELDS_MAX: usize = 15;
+
 /// Number of residuals in a GRS sentence (section 2.2.10, page 30: "Repeat times: 12").
 pub const GRS_RESIDUALS: usize = 12;
 
@@ -157,6 +167,12 @@ impl ConstellationModes {
 }
 
 /// GNS: GNSS fix data (section 2.2.8, pages 25 to 28).
+///
+/// Two layouts are decoded, told apart by the field count. The module (firmware `LC76GABNR12A05S`,
+/// 20 of 20 sentences on the bench) sends the standard NMEA one: 13 fields, no unit fields. The
+/// manufacturer's example has 14 or 15 fields, with a unit field (`M` or empty) after the altitude and
+/// after the geoid separation. Any other count, or a unit field that is neither `M` nor empty, is
+/// `Message::Malformed`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct Gns {
@@ -330,11 +346,17 @@ pub(crate) fn zda(talker: Talker, f: &[&str]) -> Parsed<Message> {
 }
 
 pub(crate) fn gns(talker: Talker, f: &[&str]) -> Parsed<Message> {
-    if !(14..=15).contains(&f.len()) {
-        return Err(Bad);
+    let with_units = match f.len() {
+        GNS_STANDARD_FIELDS => false,
+        n if (GNS_UNIT_FIELDS_MIN..=GNS_UNIT_FIELDS_MAX).contains(&n) => true,
+        _ => return Err(Bad),
+    };
+    if with_units {
+        unit_metre(at(f, 9))?;
+        unit_metre(at(f, 11))?;
     }
-    unit_metre(at(f, 9))?;
-    unit_metre(at(f, 11))?;
+    let sep = if with_units { 10 } else { 9 };
+    let diff = if with_units { 12 } else { 10 };
     Ok(Message::Gns(Gns {
         talker,
         time: field::time(at(f, 0))?,
@@ -344,10 +366,10 @@ pub(crate) fn gns(talker: Talker, f: &[&str]) -> Parsed<Message> {
         sats_used: field::uint(at(f, 6))?,
         hdop_x100: field::centi_u16(at(f, 7))?,
         alt_mm: field::metres_mm(at(f, 8))?,
-        geoid_sep_mm: field::metres_mm(at(f, 10))?,
-        diff_age_ms: field::scaled(at(f, 12), 1000, 1)?,
-        diff_station: field::uint(at(f, 13))?,
-        nav_status: match at(f, 14).as_bytes() {
+        geoid_sep_mm: field::metres_mm(at(f, sep))?,
+        diff_age_ms: field::scaled(at(f, diff), 1000, 1)?,
+        diff_station: field::uint(at(f, diff + 1))?,
+        nav_status: match at(f, diff + 2).as_bytes() {
             [] => None,
             [c] => Some(*c),
             _ => return Err(Bad),

@@ -262,6 +262,79 @@ fn gns_malformed() {
 }
 
 #[test]
+fn gns_standard_layout() {
+    let g = gns(&frame(
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,-0.335,,,V",
+    ));
+    assert_eq!(g.talker, Talker::Gn);
+    assert_eq!(g.time, time(5, 31, 6, 0));
+    assert_eq!(g.lat_e7, Some(318_222_365));
+    assert_eq!(g.lon_e7, Some(1_171_158_109));
+    let modes = g.modes.expect("mode indicator");
+    assert_eq!(
+        modes.modes,
+        [
+            Some(PositionMode::Autonomous),
+            Some(PositionMode::Autonomous),
+            Some(PositionMode::Autonomous),
+            Some(PositionMode::Autonomous),
+            Some(PositionMode::NoFix),
+            Some(PositionMode::NoFix)
+        ]
+    );
+    assert_eq!(modes.reported(), 6);
+    assert_eq!(g.sats_used, Some(24));
+    assert_eq!(g.hdop_x100, Some(60));
+    assert_eq!(g.alt_mm, Some(51_287));
+    assert_eq!(g.geoid_sep_mm, Some(-335));
+    assert_eq!((g.diff_age_ms, g.diff_station), (None, None));
+    assert_eq!(g.nav_status, Some(b'V'));
+    let g = gns(&frame(
+        "GPGNS,010203.040,,,,,ANDEMR,3,99.00,-1.5,2.250,12.5,0123,V",
+    ));
+    assert_eq!(g.talker, Talker::Gp);
+    assert_eq!(g.time, time(1, 2, 3, 40));
+    assert_eq!((g.lat_e7, g.lon_e7), (None, None));
+    assert_eq!(g.modes.map(|m| m.reported()), Some(6));
+    assert_eq!(g.hdop_x100, Some(9900));
+    assert_eq!(g.alt_mm, Some(-1500));
+    assert_eq!(g.geoid_sep_mm, Some(2250));
+    assert_eq!((g.diff_age_ms, g.diff_station), (Some(12_500), Some(123)));
+    let g = gns(&frame(&empty("GNGNS", 13)));
+    assert_eq!(
+        g,
+        Gns {
+            talker: Talker::Gn,
+            time: None,
+            lat_e7: None,
+            lon_e7: None,
+            modes: None,
+            sats_used: None,
+            hdop_x100: None,
+            alt_mm: None,
+            geoid_sep_mm: None,
+            diff_age_ms: None,
+            diff_station: None,
+            nav_status: None
+        }
+    );
+}
+
+#[test]
+fn gns_standard_layout_malformed() {
+    for body in [
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,-0.335,,V",
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,-0.335,,,V,,,",
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,M,-0.335,,,V",
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,-0.335,,,VV",
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,-0.335,x,,V",
+        "GNGNS,053106.000,3149.334190,N,11706.948654,E,AAAANN,24,0.60,51.287,M,,,V",
+    ] {
+        assert_eq!(parse_body(body), Message::Malformed, "{body}");
+    }
+}
+
+#[test]
 fn gst_spec_example() {
     let g = gst(SPEC_GST);
     assert_eq!(g.talker, Talker::Gn);
