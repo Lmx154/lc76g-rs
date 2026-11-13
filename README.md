@@ -4,6 +4,10 @@ Driver for the Quectel LC76G GNSS module over a UART, written for the MARV V2 Re
 
 **Status: version 0.1.0 (`publish = false`). The API may still change.** It has been exercised on one board and one module firmware; see "Not covered and not verified".
 
+## Works with
+
+The driver works with any HAL and any MCU whose UART implements `embedded-io-async` 0.7 (async driver) or `embedded-io` 0.7 (`blocking::Lc76g`). The framer, decoders and encoder need no I/O at all. No embassy crate is needed.
+
 ## Quick start
 
 No hardware needed. The bytes go through the framer, each valid sentence is decoded, and the fix builder joins the GGA and RMC of one epoch. The coordinates are made up. A bad checksum or a malformed field comes back as a value, not as a panic.
