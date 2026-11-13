@@ -2,7 +2,7 @@
 
 Driver for the Quectel LC76G GNSS module over a UART, written for the MARV V2 Rev 1 flight controller. The crate is `no_std` and has three layers. The NMEA framer (`Framer`), the sentence decoders (`Sentence::parse`), the fix builder (`FixBuilder`) and the command encoder (`Command::write`) work on bytes and need no I/O at all. On top of them, `Lc76g` drives a UART through the `embedded-io-async` traits, and `blocking::Lc76g` does the same through the `embedded-io` traits. The only dependencies are `embedded-io` 0.7, `embedded-io-async` 0.7 and, optionally, `defmt`.
 
-**Status: version 0.1.0 (`publish = false`). The API may still change.** It has been exercised on one board and one module firmware; see "Not covered and not verified".
+**Status: version 0.1.0, prepared for crates.io. The API may still change.** It has been exercised on one board and one module firmware; see "Not covered and not verified".
 
 ## Works with
 
