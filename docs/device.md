@@ -40,6 +40,26 @@ Pins: see "Pins and bus" below.
   use a buffered UART. After a probe reset the receive line can show a burst of framing errors (0 to 228 seen).
 - `$PAIR513*3D` saves the module's settings to its flash. Send it only when a permanent change is intended.
 
+### PQTMPVT probe (2026-11-21, `LC76GABNR12A05S` dated 2025/09/25, `hil/src/bin/lc76g_pvt.rs`, one run)
+
+- Specification: `PQTMPVT` is in protocol specification V1.4 (2024-03-05, chapter 2.3.8, pages 40 to 42; added in V1.3), not in V1.1.
+  Fields: MsgVer (1), TOW (ms), Date (UTC YYYYMMDD), Time (UTC hhmmss.sss), Quality (as GGA), FixMode (0/2/3), NumSatUsed,
+  LeapS (s), Lat, Lon (degree), Alt (m above mean sea level), Sep (m), VelN, VelE, VelD ("Down velocity", m/s), Spd (m/s),
+  Heading (degree), HDOP, PDOP. The specification states no sign for VelD beyond its name.
+- The module was at its flight configuration (`$PAIR051,200`, 19 sentences/s). `$PQTMCFGMSGRATE,R,PQTMPVT,1` answered
+  `$PQTMCFGMSGRATE,OK,PQTMPVT,0,1` (off); `,W,PQTMPVT,1,1` and `,W,PQTMPVT,0,1` each answered `$PQTMCFGMSGRATE,OK` in
+  6 ms. No restart, no change of the fix interval (read back 200 ms after), no `PQTMPVT` in the 3 s after disabling.
+- Output: one `PQTMPVT` per fix (100 in 20 s, 0 malformed), period 175 to 222 ms (mean 200.0 ms), 20 fields as specified,
+  136 to 139 bytes with CR LF: longer than `MAX_SENTENCE_LEN` (128), so the driver's framer drops every one as an
+  overflow (seen in a first run: 105 overflows in 20 s). Example, position fields masked:
+  `$PQTMPVT,1,542618800,20261121,064320.800,2,3,34,18,###,###,###,###,-0.002,0.004,0.000,0.001,251.18,0.42,0.80`.
+- Timing: Time equals the RMC time of the same epoch (100 of 100 paired); TOW is GPS time of week (UTC + LeapS 18 s).
+  The `PQTMPVT` arrives 14.5 to 16.1 ms after that RMC (mean 15.8 ms), in the same burst.
+- At rest (board on the bench, fix with 32 to 34 satellites, quality 2), mm/s: VelN mean -7.6, sd 12.1, -48 to 11;
+  VelE mean -0.6, sd 13.8, -41 to 34; VelD mean -0.5, sd 0.7, -3 to 0; Spd 1 to 45; Heading held at one value.
+  The sign of VelD and its response to vertical motion are not checked (needs a lift-and-lower test).
+- Load at 5 Hz: about 690 bytes/s more (2.0 kB/s with, 1.3 kB/s without, of 11.5 kB/s), 24 sentences/s instead of 19.
+
 ## Pins and bus (from pinout.md)
 
 All GPIO are 3.3 V logic and are not 5 V tolerant.
