@@ -20,6 +20,7 @@ Pins: see "Pins and bus" below.
   and GRS off or at most once per second below 1000 ms; GSA/GSV at 10 (`with_fix_interval(100)`): 100 fixes per 10 s,
   ~65 sentences/s, replies in milliseconds. `init` sets 1000 ms first and the target interval last, so no step floods.
 - Two `$PAIR050` back to back restart the module (2026-11-20, bench, `LC76GABNR12A05S`). When the first really changes
+- Power-on (measured 2026-11-20, `LC76GABNR12A05S`, three power-ons after 22 to 47 s off): the module starts at the fix interval set before the power-off (200 ms) with its default sentence set; a `$PAIR050` in its first second or two gets `$PAIR001,050,1` and never a final result (100 sentences, about 1.5 s); the same command 5 s later is accepted.
   the rate and the second follows soon after, the module answers `$PAIR001,050,1` (being processed), sends nothing
   more, restarts by itself about 1.8 s later and returns at its stored settings (1 Hz, stored sentence set). Spacing
   from the first acknowledgement to the second send: 18, 26, 46, 47, 50, 70, 120, 170 ms restarted it (8 of 8); 207,
