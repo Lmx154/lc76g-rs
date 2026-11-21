@@ -62,6 +62,45 @@ fn run<F: Future>(f: F) -> F::Output {
     }
 }
 
+/// Delay that records every wait with the number of lines written when it began, and never waits.
+#[derive(Default)]
+struct Recorder {
+    uart: Option<Fake>,
+    calls: Vec<(usize, u64)>,
+}
+
+impl Recorder {
+    fn watching(uart: &Fake) -> Self {
+        Self {
+            uart: Some(uart.clone()),
+            calls: Vec::new(),
+        }
+    }
+
+    fn note(&mut self, ns: u64) {
+        let written = self.uart.as_ref().map_or(0, |u| u.written().len());
+        self.calls.push((written, ns));
+    }
+
+    fn total_ns(&self) -> u64 {
+        self.calls.iter().map(|c| c.1).sum()
+    }
+}
+
+impl embedded_hal_async::delay::DelayNs for Recorder {
+    async fn delay_ns(&mut self, ns: u32) {
+        self.note(u64::from(ns));
+    }
+}
+
+impl embedded_hal::delay::DelayNs for Recorder {
+    fn delay_ns(&mut self, ns: u32) {
+        self.note(u64::from(ns));
+    }
+}
+
+const SETTLE_NS: u64 = FIX_INTERVAL_SETTLE_MS as u64 * 1_000_000;
+
 // ---- checksum, commands ----
 
 #[test]
@@ -1042,7 +1081,7 @@ fn init_checks_the_link_then_writes_every_setting_and_never_saves() {
         nav_mode: NavMode::Drone,
         ..Config::with_fix_interval(100)
     };
-    let version = run(gnss.init(&config)).unwrap();
+    let version = run(gnss.init(&config, &mut Recorder::default())).unwrap();
     assert_eq!(version.version(), "LC76GABNR12A05S");
     let bodies: Vec<String> = fake
         .written()
@@ -1090,13 +1129,56 @@ fn init_checks_the_link_then_writes_every_setting_and_never_saves() {
 fn init_default_config_has_no_optional_commands() {
     let fake = Fake::default().responder(friendly);
     let mut gnss = Lc76g::new(fake.clone());
-    run(gnss.init(&Config::default())).unwrap();
+    run(gnss.init(&Config::default(), &mut Recorder::default())).unwrap();
     let w = fake.written();
     assert_eq!(w.len(), 14);
     assert_eq!(w[1], "$PAIR050,1000*12");
     assert_eq!(w[12], "$PQTMCFGMSGRATE,W,PQTMEPE,0,2*1C");
     assert_eq!(w[13], "$PAIR080,0*2E");
     assert_eq!(w.iter().filter(|l| l.starts_with("$PAIR050")).count(), 1);
+}
+
+#[test]
+fn init_holds_the_fix_interval_settle_time_before_the_second_command() {
+    let fake = Fake::default().responder(friendly);
+    let mut gnss = Lc76g::new(fake.clone());
+    let mut delay = Recorder::watching(&fake);
+    run(gnss.init(&Config::with_fix_interval(200), &mut delay)).unwrap();
+    let w = fake.written();
+    let first = w.iter().position(|l| l.starts_with("$PAIR050")).unwrap();
+    let last = w.iter().rposition(|l| l.starts_with("$PAIR050")).unwrap();
+    assert_ne!(first, last);
+    assert_eq!(w.iter().filter(|l| l.starts_with("$PAIR050")).count(), 2);
+    assert_eq!(delay.calls.len(), 1);
+    // the wait began after the first command and before the last one was written
+    assert!(delay.calls[0].0 > first && delay.calls[0].0 == last);
+    assert!(delay.total_ns() >= SETTLE_NS);
+    assert_eq!(FIX_INTERVAL_SETTLE_MS, 500);
+}
+
+#[test]
+fn blocking_init_holds_the_settle_time_with_the_blocking_delay() {
+    let fake = Fake::default().responder(friendly);
+    let mut gnss = blocking::Lc76g::new(fake.clone());
+    let mut delay = Recorder::watching(&fake);
+    gnss.init(&Config::with_fix_interval(200), &mut delay)
+        .unwrap();
+    let w = fake.written();
+    let last = w.iter().rposition(|l| l.starts_with("$PAIR050")).unwrap();
+    assert_eq!(delay.calls.len(), 1);
+    assert_eq!(delay.calls[0].0, last);
+    assert!(delay.total_ns() >= SETTLE_NS);
+}
+
+#[test]
+fn init_at_1000_ms_sends_one_fix_interval_command_and_never_waits() {
+    let fake = Fake::default().responder(friendly);
+    let mut gnss = Lc76g::new(fake.clone());
+    let mut delay = Recorder::watching(&fake);
+    run(gnss.init(&Config::with_fix_interval(1000), &mut delay)).unwrap();
+    let w = fake.written();
+    assert_eq!(w.iter().filter(|l| l.starts_with("$PAIR050")).count(), 1);
+    assert!(delay.calls.is_empty());
 }
 
 #[test]
@@ -1107,12 +1189,18 @@ fn invalid_config_sends_nothing() {
         fix_interval_ms: 50,
         ..Config::default()
     };
-    assert_eq!(run(gnss.init(&config)), Err(Error::InvalidConfig));
+    assert_eq!(
+        run(gnss.init(&config, &mut Recorder::default())),
+        Err(Error::InvalidConfig)
+    );
     let flooded = Config {
         fix_interval_ms: 100,
         ..Config::default()
     };
-    assert_eq!(run(gnss.init(&flooded)), Err(Error::InvalidConfig));
+    assert_eq!(
+        run(gnss.init(&flooded, &mut Recorder::default())),
+        Err(Error::InvalidConfig)
+    );
     assert!(fake.written().is_empty());
 }
 
@@ -1131,7 +1219,7 @@ fn rejected_command_reports_id_and_code_and_stops_init() {
         ..Config::default()
     };
     assert_eq!(
-        run(gnss.init(&config)),
+        run(gnss.init(&config, &mut Recorder::default())),
         Err(Error::Rejected {
             command: CommandId::Pair(80),
             code: 4
@@ -1235,7 +1323,9 @@ fn save_settings_is_explicit_and_saves_both_stores() {
 fn blocking_driver_runs_the_same_code() {
     let fake = Fake::default().responder(friendly);
     let mut gnss = blocking::Lc76g::new(fake.clone());
-    let version = gnss.init(&Config::default()).unwrap();
+    let version = gnss
+        .init(&Config::default(), &mut Recorder::default())
+        .unwrap();
     assert_eq!(version.version(), "LC76GABNR12A05S");
     assert_eq!(fake.written().len(), 14);
     fake.feed(&epoch());

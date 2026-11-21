@@ -4,6 +4,7 @@ use core::future::Future;
 use core::pin::pin;
 use core::task::{Context, Poll, Waker};
 
+use embedded_hal::delay::DelayNs;
 use embedded_io::{ErrorType, Read, Write};
 
 use crate::command::Command;
@@ -29,6 +30,23 @@ impl<U: Write> embedded_io_async::Write for Uart<U> {
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
         self.0.flush()
+    }
+}
+
+/// Blocking delay presented as an async one: the wait happens inside the call, the future is ready.
+struct Wait<'a, D>(&'a mut D);
+
+impl<D: DelayNs> embedded_hal_async::delay::DelayNs for Wait<'_, D> {
+    async fn delay_ns(&mut self, ns: u32) {
+        self.0.delay_ns(ns);
+    }
+
+    async fn delay_us(&mut self, us: u32) {
+        self.0.delay_us(us);
+    }
+
+    async fn delay_ms(&mut self, ms: u32) {
+        self.0.delay_ms(ms);
     }
 }
 
@@ -97,8 +115,12 @@ impl<U: Read + Write> Lc76g<U> {
     }
 
     /// See [`crate::Lc76g::init`].
-    pub fn init(&mut self, config: &Config) -> Result<Version, Error<U::Error>> {
-        block_on(self.inner.init(config))
+    pub fn init(
+        &mut self,
+        config: &Config,
+        delay: &mut impl DelayNs,
+    ) -> Result<Version, Error<U::Error>> {
+        block_on(self.inner.init(config, &mut Wait(delay)))
     }
 
     /// See [`crate::Lc76g::save_settings`].

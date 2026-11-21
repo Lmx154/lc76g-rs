@@ -819,7 +819,7 @@ async fn run(mut gnss: Gnss, failures: &mut u32) -> Gnss {
         ..Config::with_fix_interval(100)
     };
     let t0 = Instant::now();
-    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg)).await;
+    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg, &mut embassy_time::Delay)).await;
     let ok = matches!(r, Ok(Ok(_)));
     check!(
         *failures,
@@ -868,11 +868,11 @@ async fn main(_spawner: Spawner) {
 
     // R5: restore. The module ends at 1 Hz, normal mode, default sentences, EPE off.
     let _ = with_timeout(Duration::from_secs(3), gnss.command(&zda_rate(0))).await;
-    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     if !matches!(r, Ok(Ok(_))) {
         defmt::error!("[INFO] R5 first init failed, trying again after back_to_1hz");
         back_to_1hz(&mut gnss).await;
-        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     }
     check!(
         failures,

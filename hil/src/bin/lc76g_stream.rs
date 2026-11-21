@@ -1049,11 +1049,11 @@ async fn back_to_1hz(gnss: &mut Gnss) -> bool {
 
 /// `init(&Config::default())`, once more after `back_to_1hz` if the first try fails.
 async fn restore_default(gnss: &mut Gnss) -> bool {
-    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     if !matches!(r, Ok(Ok(_))) {
         defmt::error!("[INFO] first init(default) failed, trying again after back_to_1hz");
         back_to_1hz(gnss).await;
-        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     }
     if let Ok(Err(e)) = &r {
         defmt::error!("[INFO] init(default) error: {}", e);
@@ -1227,7 +1227,7 @@ async fn main(_spawner: Spawner) {
         epe: true,
         ..Config::with_fix_interval(100)
     };
-    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg)).await;
+    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg, &mut embassy_time::Delay)).await;
     check!(
         failures,
         matches!(r, Ok(Ok(_))),

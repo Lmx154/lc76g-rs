@@ -13,6 +13,12 @@ use crate::*;
 
 const CASES: u32 = 2500;
 
+struct NoDelay;
+
+impl embedded_hal::delay::DelayNs for NoDelay {
+    fn delay_ns(&mut self, _ns: u32) {}
+}
+
 const TALKERS: [Talker; 6] = [
     Talker::Gp,
     Talker::Gl,
@@ -292,7 +298,7 @@ proptest! {
         let _ = match which {
             0 => gnss.command(&Command::Raw(&body)).map(|_| ()),
             1 => gnss.version().map(|_| ()),
-            2 => gnss.init(&Config::default()).map(|_| ()),
+            2 => gnss.init(&Config::default(), &mut NoDelay).map(|_| ()),
             3 => gnss.save_settings(),
             _ => gnss.command(&Command::QueryVersion),
         };

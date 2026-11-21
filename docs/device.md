@@ -19,6 +19,14 @@ Pins: see "Pins and bus" below.
   One epoch at the default rates is 19 sentences (4 GSA, 11 to 12 GSV). `Config::is_valid` therefore requires GSA, GSV
   and GRS off or at most once per second below 1000 ms; GSA/GSV at 10 (`with_fix_interval(100)`): 100 fixes per 10 s,
   ~65 sentences/s, replies in milliseconds. `init` sets 1000 ms first and the target interval last, so no step floods.
+- Two `$PAIR050` back to back restart the module (2026-11-20, bench, `LC76GABNR12A05S`). When the first really changes
+  the rate and the second follows soon after, the module answers `$PAIR001,050,1` (being processed), sends nothing
+  more, restarts by itself about 1.8 s later and returns at its stored settings (1 Hz, stored sentence set). Spacing
+  from the first acknowledgement to the second send: 18, 26, 46, 47, 50, 70, 120, 170 ms restarted it (8 of 8); 207,
+  271, 370, 470, 519, 771, 970 ms were accepted (7 of 7); 97 ms accepted once. A resend does not help. After every
+  applied change the module sends an unsolicited `$PAIR001,124,0` 114 to 241 ms after the acknowledgement. `init`
+  waits `FIX_INTERVAL_SETTLE_MS` = 500 ms (about 3x the latest restart, 2x the latest `124`) before the last
+  fix-interval command, with the delay passed to it; at 1000 ms it sends one command and never waits.
 - 10 Hz fix times are not on a 100 ms grid: about 57 of 99 steps are exactly 100 ms, the rest 89 to 107 ms, rarely up
   to 172 ms. After a return to 1 Hz one step of 1277 to 1483 ms precedes the 1000 ms steps.
 - Drone mode (`$PAIR080,5`): coordinates still have six decimals of minutes (`ddmm.mmmmmm,N,dddmm.mmmmmm,W`), not

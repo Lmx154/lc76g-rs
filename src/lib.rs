@@ -13,7 +13,8 @@
 //! Receive-only wiring (module TX to the MCU only) works: `read_sentence`, `read` and `read_fix` need
 //! only `Read`. `command`, `version`, `init` and `save_settings` need `Write` as well.
 //!
-//! The driver owns no timer, pin or task. A silent line makes `read*` wait forever and `command` wait
+//! The driver owns no timer, pin or task; the caller lends a delay to `init`, which uses it only to
+//! hold [`FIX_INTERVAL_SETTLE_MS`] between two fix-interval commands. A silent line makes `read*` wait forever and `command` wait
 //! for its acknowledgement until [`ACK_SENTENCE_LIMIT`] other sentences have passed: in async code wrap
 //! calls in your executor's timeout, with the blocking driver give the UART a read timeout. Hand the
 //! driver a buffered UART (interrupt or DMA ring buffer): the module sends bursts of about 20
@@ -33,7 +34,7 @@
 //! Async:
 //! ```ignore
 //! let mut gnss = lc76g::Lc76g::new(uart);
-//! let version = gnss.init(&lc76g::Config::default()).await?;
+//! let version = gnss.init(&lc76g::Config::default(), &mut delay).await?;
 //! loop {
 //!     let fix = gnss.read_fix().await?;
 //!     if fix.valid {
@@ -85,6 +86,7 @@ pub mod nmea;
 pub mod sentence;
 pub mod units;
 
+use embedded_hal_async::delay::DelayNs;
 use embedded_io_async::{Read, Write};
 
 pub use command::{Command, CommandId, StartKind};
@@ -107,6 +109,20 @@ const RX_CHUNK: usize = 64;
 /// precede the final one. 100 sentences covers several epochs of the busiest stream, which is about
 /// five seconds at the default rate, without making a dead line hang for long.
 pub const ACK_SENTENCE_LIMIT: usize = 100;
+
+/// Milliseconds [`Lc76g::init`] waits between the acknowledgement of the first `$PAIR050` and the
+/// send of the second.
+///
+/// Measured 2026-11-20 on a Quectel LC76GABNR12A05S: when the first fix-interval command really
+/// changes the rate (the module was not at 1000 ms) and a second one follows soon after, the module
+/// answers `$PAIR001,050,1` (being processed), sends nothing more, restarts by itself about 1.8 s
+/// later and comes back at its stored settings (1 Hz, stored sentence set). Spacing from the first
+/// acknowledgement to the second send: 18, 26, 46, 47, 50, 70, 120 and 170 ms restarted it (8 of 8);
+/// 207, 271, 370, 470, 519, 771 and 970 ms were accepted (7 of 7); 97 ms was accepted once. A resend
+/// does not help. After every applied change the module sends an unsolicited `$PAIR001,124,0` 114 to
+/// 241 ms after the acknowledgement. 500 ms is about three times the latest restart seen and twice
+/// the latest `124` message.
+pub const FIX_INTERVAL_SETTLE_MS: u32 = 500;
 
 /// Read-only queries `resynchronise` chooses from: `$PAIR051` (get the fix interval), `$PAIR081` (get
 /// the navigation mode) and `$PQTMVERNO`. None changes a setting or writes the module's flash.
@@ -285,6 +301,11 @@ impl<UART: Read + Write> Lc76g<UART> {
     /// ID for PAIR commands (result 1, "being processed", keeps waiting), `OK` / `ERROR` for PQTM
     /// commands. A command with no known reply ([`Command::Raw`]) returns after it is sent.
     ///
+    /// Nothing here spaces commands. A second `$PAIR050` ([`Command::SetFixInterval`]) sent within
+    /// about 0.2 s of the acknowledgement of one that changed the rate makes the module restart itself
+    /// about 1.8 s later (8 of 8 restarted at 18 to 170 ms; 7 of 7 accepted at 207 ms or more, see
+    /// [`FIX_INTERVAL_SETTLE_MS`]); the caller waits at least that constant between them.
+    ///
     /// Fixes that complete while waiting are discarded and counted in [`Stats::fixes_discarded`].
     /// Gives up after [`ACK_SENTENCE_LIMIT`] sentences; on a silent line it waits forever, see the
     /// crate docs. If an earlier call was dropped or ended without reading its acknowledgement
@@ -317,7 +338,15 @@ impl<UART: Read + Write> Lc76g<UART> {
     /// set; then the fix interval of `config` unless it is 1000 ms. The module is at 1 Hz while the
     /// rates change, so no intermediate state exceeds the line budget when moving between any two valid
     /// configurations.
-    pub async fn init(&mut self, config: &Config) -> Result<Version, Error<UART::Error>> {
+    ///
+    /// The last fix-interval command is sent [`FIX_INTERVAL_SETTLE_MS`] after the acknowledgement of
+    /// the first, waited with `delay`: a second `$PAIR050` soon after one that changed the rate makes
+    /// the module restart itself (see the constant). `delay` is not used when the interval is 1000 ms.
+    pub async fn init(
+        &mut self,
+        config: &Config,
+        delay: &mut impl DelayNs,
+    ) -> Result<Version, Error<UART::Error>> {
         if !config.is_valid() {
             return Err(Error::InvalidConfig);
         }
@@ -334,6 +363,7 @@ impl<UART: Read + Write> Lc76g<UART> {
             self.command(&Command::SetPps(pps)).await?;
         }
         if config.fix_interval_ms != 1000 {
+            delay.delay_ms(FIX_INTERVAL_SETTLE_MS).await;
             self.command(&Command::SetFixInterval {
                 ms: config.fix_interval_ms,
             })

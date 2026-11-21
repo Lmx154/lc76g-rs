@@ -1245,7 +1245,7 @@ async fn run(gnss: &mut Gnss, failures: &mut u32) {
         "[INFO] A0 GSV off + SetFixInterval(1000) took {=u32} attempts in total (2 = first try, 0 = failed)",
         back_to_1hz(gnss).await
     );
-    let r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     check!(
         *failures,
         matches!(r, Ok(Ok(_))),
@@ -1414,11 +1414,11 @@ async fn main(_spawner: Spawner) {
     run(&mut gnss, &mut failures).await;
 
     // A6: restore the default configuration.
-    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     if !matches!(r, Ok(Ok(_))) {
         defmt::error!("[INFO] A6 first init failed, trying again after back_to_1hz");
         back_to_1hz(&mut gnss).await;
-        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     }
     check!(
         failures,

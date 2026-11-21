@@ -634,14 +634,14 @@ async fn run(mut gnss: Gnss, failures: &mut u32) -> Gnss {
         fix_interval_ms: 100,
         ..Config::default()
     };
-    let r = gnss.init(&flooded).await;
+    let r = gnss.init(&flooded, &mut embassy_time::Delay).await;
     check!(
         *failures,
         matches!(r, Err(Error::InvalidConfig)),
         "{=str} S2 init(100 ms, default rates) returns InvalidConfig and sends nothing"
     );
     let t0 = Instant::now();
-    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg)).await;
+    let r = with_timeout(Duration::from_secs(15), gnss.init(&cfg, &mut embassy_time::Delay)).await;
     let init_ms = t0.elapsed().as_millis() as u32;
     let ok = matches!(r, Ok(Ok(_)));
     check!(
@@ -1033,7 +1033,7 @@ async fn run(mut gnss: Gnss, failures: &mut u32) -> Gnss {
     }
 
     // S8a: init(Config::default()) and the sentence set.
-    let r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     let default_ok = matches!(r, Ok(Ok(_)));
     check!(
         *failures,
@@ -1174,11 +1174,11 @@ async fn main(_spawner: Spawner) {
     let mut gnss = run(Lc76g::new(uart), &mut failures).await;
 
     // S9: restore. The module ends at 1 Hz, normal mode, default sentences, EPE off.
-    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+    let mut r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     if !matches!(r, Ok(Ok(_))) {
         defmt::error!("[INFO] S9 first init failed, trying again after back_to_1hz");
         back_to_1hz(&mut gnss).await;
-        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default())).await;
+        r = with_timeout(Duration::from_secs(15), gnss.init(&Config::default(), &mut embassy_time::Delay)).await;
     }
     check!(
         failures,
