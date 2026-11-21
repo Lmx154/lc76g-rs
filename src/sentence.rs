@@ -345,6 +345,75 @@ pub struct Epe {
     pub epe_3d_mm: Option<u32>,
 }
 
+/// Fix mode of `$PQTMPVT`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub enum PvtFixMode {
+    /// 0: no fix.
+    NoFix,
+    /// 2: 2D fix.
+    Fix2d,
+    /// 3: 3D fix.
+    Fix3d,
+}
+
+/// `$PQTMPVT` (version 1): position, velocity and time of one fix, from the module's PVT solution.
+///
+/// Sent once per position fix when enabled ([`Command::SetPvt`](crate::Command::SetPvt)), about
+/// 16 ms after the RMC of the same epoch on LC76GABNR12A05S. Pair it with the GGA, RMC or
+/// [`Fix`](crate::Fix) of the same epoch by `time` (and `date`): the module's PVT time equals the RMC
+/// time of its epoch (100 of 100 on the bench). `tow_ms` is GPS time of week, UTC plus `leap_s`.
+///
+/// Units as elsewhere in the crate: 1e-7 degree, mm, mm/s, 0.01 degree, DOP x100. A field the module
+/// leaves empty (invalid) is `None`. HDOP and PDOP are never empty: the module sends 99.99 when
+/// invalid, which decodes to `Some(9999)`.
+///
+/// **The sign of `vel_d_mm_s` is not verified.** The specification calls the field "down velocity"
+/// and says nothing more. On the bench only a board at rest was measured (mean -0.5 mm/s, sd
+/// 0.7 mm/s); whether a climb gives a negative or a positive value has not been checked (it needs a
+/// lift-and-lower test). Do not rely on the sign until then.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "defmt", derive(defmt::Format))]
+pub struct Pvt {
+    /// GPS time of week, milliseconds.
+    pub tow_ms: u32,
+    /// UTC date (the sentence carries the year in full, so a no-fix sentence shows the module's
+    /// start date, for example 1980-01-05).
+    pub date: Option<Date>,
+    /// UTC time of the epoch.
+    pub time: Option<Time>,
+    /// Quality indicator, as in GGA.
+    pub quality: Quality,
+    /// Fix mode.
+    pub fix_mode: PvtFixMode,
+    /// Satellites used.
+    pub sats_used: Option<u8>,
+    /// Leap seconds, GPS minus UTC.
+    pub leap_s: Option<u8>,
+    /// Latitude, 1e-7 degree, south negative.
+    pub lat_e7: Option<i32>,
+    /// Longitude, 1e-7 degree, west negative.
+    pub lon_e7: Option<i32>,
+    /// Altitude above mean sea level, mm.
+    pub alt_mm: Option<i32>,
+    /// Geoid separation, mm.
+    pub geoid_sep_mm: Option<i32>,
+    /// North velocity, mm/s, signed.
+    pub vel_n_mm_s: Option<i32>,
+    /// East velocity, mm/s, signed.
+    pub vel_e_mm_s: Option<i32>,
+    /// "Down velocity", mm/s, signed. Sign not verified, see the type's documentation.
+    pub vel_d_mm_s: Option<i32>,
+    /// Ground speed, mm/s.
+    pub speed_mm_s: Option<u32>,
+    /// Heading, 0.01 degree, 0 to 36000.
+    pub heading_cdeg: Option<u16>,
+    /// Horizontal DOP x100 (9999 when the module marks it invalid).
+    pub hdop_x100: Option<u16>,
+    /// Position (3D) DOP x100 (9999 when the module marks it invalid).
+    pub pdop_x100: Option<u16>,
+}
+
 /// PQTM commands whose reply is of the `OK` / `ERROR` form.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
@@ -397,8 +466,16 @@ pub enum Message {
     Version(Version),
     /// PQTMEPE.
     Epe(Epe),
+    /// PQTMPVT, message version 1.
+    Pvt(Pvt),
+    /// PQTMPVT of a message version other than 1 (the value is the version), not decoded.
+    PvtUnsupportedVersion(u8),
     /// PQTM OK/ERROR reply.
     PqtmReply(PqtmReply),
+    /// Answer to [`Command::GetPvtRate`](crate::Command::GetPvtRate),
+    /// `$PQTMCFGMSGRATE,OK,PQTMPVT,<rate>[,<MsgVer>]`: the `PQTMPVT` output rate, 0 = off, N = every
+    /// N-th fix.
+    PvtRate(u8),
     /// Valid sentence of a type this crate does not decode (RLM, other PAIR and PQTM).
     Other,
     /// Valid checksum but the fields do not match the layout of the specification.
@@ -433,7 +510,8 @@ pub(crate) fn decode_fields(address: &str, f: &[&str]) -> Parsed<Message> {
         "PAIR001" => return ack(f),
         "PQTMVERNO" => return version(f),
         "PQTMEPE" => return epe(f),
-        "PQTMCFGMSGRATE" => return pqtm_reply(PqtmCommand::CfgMsgRate, f),
+        "PQTMPVT" => return pvt(f),
+        "PQTMCFGMSGRATE" => return cfg_msg_rate(f),
         "PQTMSAVEPAR" => return pqtm_reply(PqtmCommand::SavePar, f),
         _ => {}
     }
@@ -626,6 +704,13 @@ fn pqtm_error(command: PqtmCommand, f: &[&str]) -> Parsed<Option<Message>> {
     Ok(None)
 }
 
+fn cfg_msg_rate(f: &[&str]) -> Parsed<Message> {
+    if f.first() == Some(&"OK") && f.get(1) == Some(&"PQTMPVT") {
+        return Ok(Message::PvtRate(field::uint_req(at(f, 2)?)?));
+    }
+    pqtm_reply(PqtmCommand::CfgMsgRate, f)
+}
+
 fn pqtm_reply(command: PqtmCommand, f: &[&str]) -> Parsed<Message> {
     if let Some(m) = pqtm_error(command, f)? {
         return Ok(m);
@@ -675,6 +760,40 @@ fn version(f: &[&str]) -> Parsed<Message> {
             second: field::uint_req(s)?,
             millis: 0,
         },
+    }))
+}
+
+fn pvt(f: &[&str]) -> Parsed<Message> {
+    match field::uint_req::<u8>(at(f, 0)?)? {
+        1 => {}
+        other => return Ok(Message::PvtUnsupportedVersion(other)),
+    }
+    need(f, 19)?;
+    let fix_mode = match field::uint_req::<u8>(at(f, 5)?)? {
+        0 => PvtFixMode::NoFix,
+        2 => PvtFixMode::Fix2d,
+        3 => PvtFixMode::Fix3d,
+        _ => return Err(Bad),
+    };
+    Ok(Message::Pvt(Pvt {
+        tow_ms: field::uint_req(at(f, 1)?)?,
+        date: field::date_ymd(at(f, 2)?)?,
+        time: field::time(at(f, 3)?)?,
+        quality: field::uint_req::<u8>(at(f, 4)?).and_then(|c| Quality::from_code(c).ok_or(Bad))?,
+        fix_mode,
+        sats_used: field::uint(at(f, 6)?)?,
+        leap_s: field::uint(at(f, 7)?)?,
+        lat_e7: field::degrees_e7(at(f, 8)?, 90)?,
+        lon_e7: field::degrees_e7(at(f, 9)?, 180)?,
+        alt_mm: field::metres_mm(at(f, 10)?)?,
+        geoid_sep_mm: field::metres_mm(at(f, 11)?)?,
+        vel_n_mm_s: field::metres_mm(at(f, 12)?)?,
+        vel_e_mm_s: field::metres_mm(at(f, 13)?)?,
+        vel_d_mm_s: field::metres_mm(at(f, 14)?)?,
+        speed_mm_s: field::scaled(at(f, 15)?, 1000, 1)?,
+        heading_cdeg: field::course_cdeg(at(f, 16)?)?,
+        hdop_x100: field::centi_u16(at(f, 17)?)?,
+        pdop_x100: field::centi_u16(at(f, 18)?)?,
     }))
 }
 

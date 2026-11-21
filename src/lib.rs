@@ -31,6 +31,10 @@
 //! Units: coordinates are `i32` in 1e-7 degree, altitude `i32` mm, speed `u32` mm/s, course `u16` in
 //! 0.01 degree, DOP `u16` x100. [`units`] converts to floating point.
 //!
+//! `$PQTMPVT` (position, velocity, time; enable it with [`Command::SetPvt`] or [`Config::pvt_rate`]) is decoded
+//! to [`sentence::Message::Pvt`] and is not part of [`fix::Fix`]: it follows the RMC of its epoch, so a fix is never
+//! held back for it; pair it by [`sentence::Pvt::time`]. The sign of its down velocity is not verified.
+//!
 //! Async:
 //! ```ignore
 //! let mut gnss = lc76g::Lc76g::new(uart);
@@ -329,13 +333,23 @@ impl<UART: Read + Write> Lc76g<UART> {
         }
     }
 
+    /// Reads the `$PQTMPVT` output rate ([`Command::GetPvtRate`]): 0 = off, N = every N-th fix.
+    pub async fn pvt_rate(&mut self) -> Result<u8, Error<UART::Error>> {
+        match self.exchange(&Command::GetPvtRate).await? {
+            Some(Message::PvtRate(rate)) => Ok(rate),
+            // Only a plain `OK` of an earlier PQTMCFGMSGRATE command (a stale answer) ends up here.
+            _ => Err(Error::NoAck),
+        }
+    }
+
     /// Link check with [`Lc76g::version`], then writes every setting of `config`, each acknowledged.
     /// Validates `config` before sending anything ([`Config::is_valid`], which includes the stream
     /// budget). Never saves to the module's flash; the settings last until power loss or reset (or
     /// until [`Lc76g::save_settings`]).
     ///
-    /// Order: version query; fix interval 1000 ms; every sentence rate; EPE; navigation mode; PPS if
-    /// set; then the fix interval of `config` unless it is 1000 ms. The module is at 1 Hz while the
+    /// Order: version query; fix interval 1000 ms; every sentence rate; EPE; `$PQTMPVT` rate if
+    /// [`Config::pvt_rate`] is not 0 (with 0 nothing is sent: a PVT output enabled earlier stays on,
+    /// switch it off with [`Command::SetPvt`]); navigation mode; PPS if set; then the fix interval of `config` unless it is 1000 ms. The module is at 1 Hz while the
     /// rates change, so no intermediate state exceeds the line budget when moving between any two valid
     /// configurations.
     ///
@@ -358,6 +372,12 @@ impl<UART: Read + Write> Lc76g<UART> {
                 .await?;
         }
         self.command(&Command::SetEpe(config.epe)).await?;
+        if config.pvt_rate != 0 {
+            self.command(&Command::SetPvt {
+                rate: config.pvt_rate,
+            })
+            .await?;
+        }
         self.command(&Command::SetNavMode(config.nav_mode)).await?;
         if let Some(pps) = config.pps {
             self.command(&Command::SetPps(pps)).await?;

@@ -114,6 +114,11 @@ impl<U: Read + Write> Lc76g<U> {
         block_on(self.inner.version())
     }
 
+    /// See [`crate::Lc76g::pvt_rate`].
+    pub fn pvt_rate(&mut self) -> Result<u8, Error<U::Error>> {
+        block_on(self.inner.pvt_rate())
+    }
+
     /// See [`crate::Lc76g::init`].
     pub fn init(
         &mut self,

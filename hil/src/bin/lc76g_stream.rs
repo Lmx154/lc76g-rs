@@ -444,6 +444,8 @@ fn variant_matches(m: &Message, key: &str) -> bool {
         Message::Ack(_) => key == "PAIR001",
         Message::Version(_) => key == "PQTMVERNO",
         Message::Epe(_) => key == "PQTMEPE",
+        Message::Pvt(_) | Message::PvtUnsupportedVersion(_) => key == "PQTMPVT",
+        Message::PvtRate(_) => key == "PQTMCFGMSGRATE",
         Message::PqtmReply(_) => key == "PQTMCFGMSGRATE" || key == "PQTMSAVEPAR",
         Message::Other | Message::Malformed => true,
     }

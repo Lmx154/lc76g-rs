@@ -158,7 +158,7 @@ fn field_text() -> impl Strategy<Value = String> {
     ]
 }
 
-const SAMPLES: [&str; 13] = [
+const SAMPLES: [&str; 15] = [
     "GNRMC,040143.000,A,3149.334166,N,11706.941670,E,0.01,0.00,010522,,,D,V",
     "GNGGA,040143.000,3149.334166,N,11706.941670,E,2,36,0.48,61.496,M,-0.335,M,,",
     "GNGSA,A,3,195,01,194,21,07,30,199,08,14,17,27,,0.71,0.48,0.52,1",
@@ -172,6 +172,8 @@ const SAMPLES: [&str; 13] = [
     "PAIR001,004,0",
     "PQTMEPE,2,1.000,1.000,1.000,1.414,1.732",
     "PQTMVERNO,LC76GABNR02A01S,2022/09/14,11:47:03",
+    "PQTMPVT,1,542618800,20261121,064320.800,2,3,34,18,10.000000,20.000000,100.000,-20.500,-0.002,0.004,0.000,0.001,251.18,0.42,0.80",
+    "PQTMCFGMSGRATE,OK,PQTMPVT,5,1",
 ];
 
 fn multibyte_text() -> impl Strategy<Value = String> {
@@ -200,6 +202,7 @@ fn address_text() -> impl Strategy<Value = String> {
         "PAIR001",
         "PQTMVERNO",
         "PQTMEPE",
+        "PQTMPVT",
         "PQTMCFGMSGRATE",
         "PQTMSAVEPAR",
         "PAIR",
@@ -323,6 +326,8 @@ proptest! {
             Command::SetPps(Pps { kind: PpsType::Always, width_ms: width }),
             Command::Start(StartKind::Hot),
             Command::SetEpe(true),
+            Command::SetPvt { rate },
+            Command::GetPvtRate,
             Command::SaveSettings,
             Command::SavePqtm,
         ];
@@ -396,6 +401,21 @@ proptest! {
         let _ = (scaled::<i32>(&a, num, den), scaled::<u32>(&a, num, den), scaled::<u16>(&a, num, den));
         let _ = (metres_mm(&a), centi_u16(&a), knots_mm_s(&a), kmh_mm_s(&a), course_cdeg(&a));
         let _ = (latitude(&a, &b), longitude(&a, &b), time(&a), date(&a));
+        let _ = (degrees_e7(&a, 90), degrees_e7(&b, 180), date_ymd(&a), date_ymd(&b));
+    }
+
+    // `$PQTMPVT` and the read-back of its rate: arbitrary fields straight into the decoder.
+    #[test]
+    fn pvt_arbitrary_fields(
+        fields in proptest::collection::vec(field_text(), 0..30),
+        version in prop_oneof![Just("1".to_string()), Just("2".to_string()), field_text()],
+    ) {
+        let mut refs: Vec<&str> = fields.iter().map(String::as_str).collect();
+        if let Some(first) = refs.first_mut() {
+            *first = &version;
+        }
+        let _ = crate::sentence::decode_fields("PQTMPVT", &refs);
+        let _ = crate::sentence::decode_fields("PQTMCFGMSGRATE", &refs);
     }
 
     #[test]
@@ -422,13 +442,13 @@ proptest! {
     fn multibyte_text_in_every_field_position(
         a in multibyte_text(),
         b in multibyte_text(),
-        sample in 0usize..13,
+        sample in 0usize..15,
         index in 0usize..20,
         all_fields in any::<bool>(),
     ) {
         use crate::field::*;
         let _ = (uint::<u8>(&a), uint_req::<u16>(&a), scaled::<i32>(&a, 1000, 1), metres_mm(&a),
-                 centi_u16(&a), knots_mm_s(&a), kmh_mm_s(&a), course_cdeg(&a), time(&a), date(&a),
+                 centi_u16(&a), knots_mm_s(&a), kmh_mm_s(&a), course_cdeg(&a), time(&a), date(&a), date_ymd(&a), degrees_e7(&a, 180),
                  latitude(&a, "N"), latitude(&a, &b), longitude(&a, "E"), longitude(&a, &b));
         let mut fields: Vec<&str> = SAMPLES[sample].split(',').collect();
         let address = fields.remove(0);
@@ -459,10 +479,14 @@ fn regression_multibyte_cut_offsets() {
         let _ = (
             time(text),
             date(text),
+            date_ymd(text),
+            degrees_e7(text, 90),
             latitude(text, "N"),
             longitude(text, "E"),
         );
     }
+    assert!(date_ymd("€€").is_err());
+    assert!(degrees_e7("é1é1é1", 90).is_err());
     assert!(latitude("1é2.5", "N").is_err());
     assert!(longitude("12é1.5", "E").is_err());
     assert!(date("€€").is_err());

@@ -146,6 +146,34 @@ pub(crate) fn course_cdeg(s: &str) -> Parsed<Option<u16>> {
     }
 }
 
+/// Signed decimal degrees to 1e-7 degree, at most `max_deg` in magnitude.
+pub(crate) fn degrees_e7(s: &str, max_deg: i32) -> Parsed<Option<i32>> {
+    match scaled::<i32>(s, 10_000_000, 1)? {
+        Some(v) if i64::from(v).abs() > i64::from(max_deg) * 10_000_000 => Err(Bad),
+        v => Ok(v),
+    }
+}
+
+/// `YYYYMMDD`.
+pub(crate) fn date_ymd(s: &str) -> Parsed<Option<Date>> {
+    opt(s, |s| {
+        if s.len() != 8 {
+            return None;
+        }
+        let year = digits_value(s.get(0..4)?)?;
+        let month = digits_value(s.get(4..6)?)?;
+        let day = digits_value(s.get(6..8)?)?;
+        if !(1..=31).contains(&day) || !(1..=12).contains(&month) {
+            return None;
+        }
+        Some(Date {
+            year: year as u16,
+            month: month as u8,
+            day: day as u8,
+        })
+    })
+}
+
 /// `ddmm.mmmm` / `dddmm.mmmm` plus hemisphere letter to 1e-7 degree.
 fn coordinate(
     value: &str,

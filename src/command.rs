@@ -53,7 +53,8 @@ impl CommandId {
                 1 => Outcome::Wait,
                 code => Outcome::Rejected(code),
             },
-            (Self::Pqtm(PqtmCommand::VerNo), Message::Version(_)) => Outcome::Done,
+            (Self::Pqtm(PqtmCommand::VerNo), Message::Version(_))
+            | (Self::Pqtm(PqtmCommand::CfgMsgRate), Message::PvtRate(_)) => Outcome::Done,
             (Self::Pqtm(command), Message::PqtmReply(reply)) if reply.command == command => {
                 match reply.error {
                     None => Outcome::Done,
@@ -100,6 +101,15 @@ pub enum Command<'a> {
     Start(StartKind),
     /// `$PQTMCFGMSGRATE,W,PQTMEPE,<0|1>,2`: `$PQTMEPE` output on or off.
     SetEpe(bool),
+    /// `$PQTMCFGMSGRATE,W,PQTMPVT,<rate>,1`: `$PQTMPVT` (position, velocity, time) output once per
+    /// `rate` fixes, 0 = off, 1 to 20 (specification Table 6).
+    SetPvt {
+        /// Rate, 0 to 20.
+        rate: u8,
+    },
+    /// `$PQTMCFGMSGRATE,R,PQTMPVT,1`: read the `$PQTMPVT` rate; answered by [`Message::PvtRate`]
+    /// (see [`Lc76g::pvt_rate`](crate::Lc76g::pvt_rate)).
+    GetPvtRate,
     /// `$PAIR513`: save the current settings to the module's flash.
     SaveSettings,
     /// `$PQTMSAVEPAR`: save the PQTM settings (EPE output) to the module's NVDM.
@@ -123,7 +133,9 @@ impl Command<'_> {
             Self::Start(StartKind::Warm) => CommandId::Pair(5),
             Self::Start(StartKind::Cold) => CommandId::Pair(6),
             Self::Start(StartKind::FullCold) => CommandId::Pair(7),
-            Self::SetEpe(_) => CommandId::Pqtm(PqtmCommand::CfgMsgRate),
+            Self::SetEpe(_) | Self::SetPvt { .. } | Self::GetPvtRate => {
+                CommandId::Pqtm(PqtmCommand::CfgMsgRate)
+            }
             Self::SaveSettings => CommandId::Pair(513),
             Self::SavePqtm => CommandId::Pqtm(PqtmCommand::SavePar),
             Self::Raw(body) => return raw_reply(body),
@@ -170,6 +182,12 @@ impl Command<'_> {
             } else {
                 "PQTMCFGMSGRATE,W,PQTMEPE,0,2"
             })?,
+            Self::SetPvt { rate } => {
+                out.str("PQTMCFGMSGRATE,W,PQTMPVT,")?;
+                out.uint(u32::from(*rate))?;
+                out.str(",1")?;
+            }
+            Self::GetPvtRate => out.str("PQTMCFGMSGRATE,R,PQTMPVT,1")?,
             Self::SaveSettings => out.str("PAIR513")?,
             Self::SavePqtm => out.str("PQTMSAVEPAR")?,
             Self::Raw(body) => {

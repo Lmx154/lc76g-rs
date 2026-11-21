@@ -6,11 +6,16 @@ use crate::sentence::Message;
 /// Longest sentence the [`Framer`] holds, `$` to the last checksum digit, in bytes.
 ///
 /// Section 2.1 of the protocol specification defines the layout but gives no length limit; NMEA 0183
-/// itself allows 82 characters including the `$` and CR LF. The longest sentences this crate decodes
-/// are RMC and GGA with seven-decimal coordinates in drone mode (about 85 bytes) and GSA with twelve
-/// three-digit satellite IDs (about 85 bytes). 128 leaves about 40 % margin over that and still costs
-/// only 128 bytes of RAM. Longer input is counted as an overflow and skipped.
-pub const MAX_SENTENCE_LEN: usize = 128;
+/// itself allows 82 characters including the `$` and CR LF. The longest NMEA sentences this crate
+/// decodes are RMC and GGA with seven-decimal coordinates in drone mode (about 85 bytes) and GSA with
+/// twelve three-digit satellite IDs (about 85 bytes). The longest sentence of all is `$PQTMPVT`
+/// (section 2.3.8 of specification V1.4): measured 134 to 137 bytes without CR LF on LC76GABNR12A05S
+/// (eight decimals in latitude and longitude). Worst case from the field widths, with margin for more
+/// digits and signs: `$PQTMPVT,` 9, the 19 fields 125 (MsgVer 1, TOW 9, Date 8, Time 10, Quality 1,
+/// FixMode 1, NumSatUsed 3, LeapS 2, Lat 12, Lon 13, Alt 10, Sep 8, VelN, VelE and VelD 8 each, Spd 7,
+/// Heading 6, HDOP 5, PDOP 5), 18 commas and `*CS` 3: 155 bytes. 160 holds that with 5 bytes to spare
+/// and costs 160 bytes of RAM in the framer. Longer input is counted as an overflow and skipped.
+pub const MAX_SENTENCE_LEN: usize = 160;
 
 /// XOR of all bytes of `body` (the characters between `$` and `*`), as in section 2.1.
 pub fn checksum(body: &[u8]) -> u8 {

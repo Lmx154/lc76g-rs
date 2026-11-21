@@ -1711,3 +1711,512 @@ fn a_drop_inside_the_resynchronisation_is_followed_by_a_correct_command() {
         assert!(swept >= 5, "{swept}");
     }
 }
+
+// ---- $PQTMPVT ----
+
+/// The bench sentence of docs/device.md with an artificial position (10 N, 20 E) and altitude.
+const PVT_BODY: &str = "PQTMPVT,1,542618800,20261121,064320.800,2,3,34,18,10.000000,20.000000,100.000,-20.500,-0.002,0.004,0.000,0.001,251.18,0.42,0.80";
+/// Specification V1.4, section 2.3.8, "No fix" example.
+const SPEC_PVT_NO_FIX: &str = "$PQTMPVT,1,1012,19800105,235943.012,0,0,00,,,,,,,,,,,99.99,99.99*46";
+
+fn pvt_of(message: Message) -> Pvt {
+    let Message::Pvt(pvt) = message else {
+        panic!("not a PQTMPVT: {message:?}")
+    };
+    pvt
+}
+
+#[test]
+fn decodes_the_bench_pvt_with_an_artificial_position() {
+    let pvt = pvt_of(parse_body(PVT_BODY));
+    assert_eq!(pvt.tow_ms, 542_618_800);
+    assert_eq!(
+        pvt.date,
+        Some(Date {
+            year: 2026,
+            month: 11,
+            day: 21
+        })
+    );
+    assert_eq!(
+        pvt.time,
+        Some(Time {
+            hour: 6,
+            minute: 43,
+            second: 20,
+            millis: 800
+        })
+    );
+    assert_eq!(
+        (pvt.quality, pvt.fix_mode),
+        (Quality::Differential, PvtFixMode::Fix3d)
+    );
+    assert_eq!((pvt.sats_used, pvt.leap_s), (Some(34), Some(18)));
+    assert_eq!(
+        (pvt.lat_e7, pvt.lon_e7),
+        (Some(100_000_000), Some(200_000_000))
+    );
+    assert_eq!(
+        (pvt.alt_mm, pvt.geoid_sep_mm),
+        (Some(100_000), Some(-20_500))
+    );
+    assert_eq!(
+        (pvt.vel_n_mm_s, pvt.vel_e_mm_s, pvt.vel_d_mm_s),
+        (Some(-2), Some(4), Some(0))
+    );
+    assert_eq!((pvt.speed_mm_s, pvt.heading_cdeg), (Some(1), Some(25_118)));
+    assert_eq!((pvt.hdop_x100, pvt.pdop_x100), (Some(42), Some(80)));
+}
+
+#[test]
+fn pvt_empty_fields_are_none_and_invalid_dop_is_kept() {
+    let pvt = pvt_of(parse(SPEC_PVT_NO_FIX));
+    assert_eq!(pvt.tow_ms, 1012);
+    assert_eq!(
+        pvt.date,
+        Some(Date {
+            year: 1980,
+            month: 1,
+            day: 5
+        })
+    );
+    assert_eq!(pvt.time.map(|t| t.millis_of_day()), Some(86_383_012));
+    assert_eq!(
+        (pvt.quality, pvt.fix_mode),
+        (Quality::NoFix, PvtFixMode::NoFix)
+    );
+    assert_eq!((pvt.sats_used, pvt.leap_s), (Some(0), None));
+    assert_eq!(
+        (pvt.lat_e7, pvt.lon_e7, pvt.alt_mm, pvt.geoid_sep_mm),
+        (None, None, None, None)
+    );
+    assert_eq!(
+        (
+            pvt.vel_n_mm_s,
+            pvt.vel_e_mm_s,
+            pvt.vel_d_mm_s,
+            pvt.speed_mm_s,
+            pvt.heading_cdeg
+        ),
+        (None, None, None, None, None)
+    );
+    assert_eq!((pvt.hdop_x100, pvt.pdop_x100), (Some(9999), Some(9999)));
+    // empty date and time too
+    let blank = pvt_of(parse_body("PQTMPVT,1,0,,,0,0,,,,,,,,,,,,,"));
+    assert_eq!(
+        (blank.date, blank.time, blank.sats_used),
+        (None, None, None)
+    );
+}
+
+#[test]
+fn pvt_negative_velocities_and_signed_position() {
+    let body = PVT_BODY
+        .replace("10.000000,20.000000", "-10.000000,-20.000000")
+        .replace("-0.002,0.004,0.000,0.001", "-1.234,-0.005,-12.500,12.600");
+    let pvt = pvt_of(parse_body(&body));
+    assert_eq!(
+        (pvt.lat_e7, pvt.lon_e7),
+        (Some(-100_000_000), Some(-200_000_000))
+    );
+    assert_eq!(
+        (
+            pvt.vel_n_mm_s,
+            pvt.vel_e_mm_s,
+            pvt.vel_d_mm_s,
+            pvt.speed_mm_s
+        ),
+        (Some(-1234), Some(-5), Some(-12_500), Some(12_600))
+    );
+}
+
+#[test]
+fn pvt_with_another_version_is_reported_not_decoded() {
+    assert_eq!(
+        parse_body(&PVT_BODY.replace("PQTMPVT,1,", "PQTMPVT,2,")),
+        Message::PvtUnsupportedVersion(2)
+    );
+    // a version 2 layout may differ: no field is looked at
+    assert_eq!(parse_body("PQTMPVT,7,x"), Message::PvtUnsupportedVersion(7));
+    assert_eq!(parse_body("PQTMPVT,0"), Message::PvtUnsupportedVersion(0));
+    for body in [
+        "PQTMPVT",
+        "PQTMPVT,",
+        "PQTMPVT,x",
+        "PQTMPVT,256",
+        "PQTMPVT,-1",
+    ] {
+        assert_eq!(parse_body(body), Message::Malformed, "{body}");
+    }
+}
+
+#[test]
+fn pvt_malformed_fields_are_values_not_panics() {
+    let cases = [
+        PVT_BODY.replace(",3,34,", ",1,34,"),
+        PVT_BODY.replace(",3,34,", ",4,34,"),
+        PVT_BODY.replace(",2,3,34,", ",7,3,34,"),
+        PVT_BODY.replace("10.000000", "90.000001"),
+        PVT_BODY.replace("20.000000", "180.5"),
+        PVT_BODY.replace("0.001,251.18", "-0.001,251.18"),
+        PVT_BODY.replace("251.18", "360.01"),
+        PVT_BODY.replace("20261121", "2026112"),
+        PVT_BODY.replace("20261121", "20261321"),
+        PVT_BODY.replace("064320.800", "6432.8"),
+        PVT_BODY.replace("542618800", "x"),
+        PVT_BODY.replace("0.42,0.80", "0.42"),
+        PVT_BODY.replace("-0.002", "1.0x"),
+    ];
+    for body in cases {
+        assert_eq!(parse_body(&body), Message::Malformed, "{body}");
+    }
+}
+
+fn longest_pvt_body() -> String {
+    "PQTMPVT,1,604799999,20261121,235959.999,6,3,100,18,-89.12345678,-179.12345678,-12345.678,-123.456,-123.456,-123.456,-123.456,123.456,360.00,99.99,99.99".to_owned()
+}
+
+#[test]
+fn the_longest_pvt_fits_the_framer_and_decodes() {
+    let line = frame(&longest_pvt_body());
+    assert_eq!(line.len(), MAX_SENTENCE_LEN - 5);
+    const { assert!(MAX_SENTENCE_LEN >= 160) };
+    let mut framer = nmea::Framer::new();
+    assert_eq!(feed(&mut framer, &lines(&[&line])), [line.as_str()]);
+    assert_eq!(framer.stats().overflows, 0);
+    let pvt = pvt_of(parse(&line));
+    assert_eq!(
+        (pvt.lat_e7, pvt.lon_e7, pvt.alt_mm, pvt.heading_cdeg),
+        (
+            Some(-891_234_568),
+            Some(-1_791_234_568),
+            Some(-12_345_678),
+            Some(36_000)
+        )
+    );
+    assert_eq!(pvt.sats_used, Some(100));
+    // the bench sentences (134 to 137 bytes) are over the former limit of 128
+    assert!(frame(PVT_BODY).len() < MAX_SENTENCE_LEN);
+}
+
+#[test]
+fn a_pvt_sentence_of_exactly_the_limit_passes_and_one_byte_more_is_an_overflow() {
+    let exact = {
+        let mut body = longest_pvt_body();
+        body.push_str(&"0".repeat(MAX_SENTENCE_LEN - frame(&body).len()));
+        frame(&body)
+    };
+    assert_eq!(exact.len(), MAX_SENTENCE_LEN);
+    let over = {
+        let mut body = longest_pvt_body();
+        body.push_str(&"0".repeat(MAX_SENTENCE_LEN + 1 - frame(&body).len()));
+        frame(&body)
+    };
+    assert_eq!(over.len(), MAX_SENTENCE_LEN + 1);
+    let mut framer = nmea::Framer::new();
+    let stream = lines(&[&over, &exact, SPEC_GLL]);
+    assert_eq!(feed(&mut framer, &stream), [exact.as_str(), SPEC_GLL]);
+    let s = framer.stats();
+    assert_eq!((s.sentences, s.checksum_errors, s.overflows), (2, 0, 1));
+    assert!(Sentence::new(&exact).is_some());
+    assert!(Sentence::new(&over).is_none());
+}
+
+#[test]
+fn pvt_commands_encode_with_independent_checksums() {
+    let cases = [
+        (
+            Command::SetPvt { rate: 1 },
+            "$PQTMCFGMSGRATE,W,PQTMPVT,1,1*1C\r\n",
+        ),
+        (
+            Command::SetPvt { rate: 0 },
+            "$PQTMCFGMSGRATE,W,PQTMPVT,0,1*1D\r\n",
+        ),
+        (
+            Command::SetPvt { rate: 20 },
+            "$PQTMCFGMSGRATE,W,PQTMPVT,20,1*2F\r\n",
+        ),
+        (Command::GetPvtRate, "$PQTMCFGMSGRATE,R,PQTMPVT,1*04\r\n"),
+    ];
+    for (command, expected) in cases {
+        assert_eq!(encode(command), expected);
+        assert_eq!(
+            command.reply(),
+            Some(CommandId::Pqtm(PqtmCommand::CfgMsgRate))
+        );
+    }
+    // the same bodies as Raw give the same reply association
+    assert_eq!(
+        Command::Raw("PQTMCFGMSGRATE,W,PQTMPVT,1,1").reply(),
+        Command::SetPvt { rate: 1 }.reply()
+    );
+}
+
+#[test]
+fn pvt_rate_answer_decodes() {
+    assert_eq!(
+        parse("$PQTMCFGMSGRATE,OK,PQTMPVT,5,1*4B"),
+        Message::PvtRate(5)
+    );
+    assert_eq!(
+        parse("$PQTMCFGMSGRATE,OK,PQTMPVT,0,1*4E"),
+        Message::PvtRate(0)
+    );
+    assert_eq!(
+        parse_body("PQTMCFGMSGRATE,OK,PQTMPVT,20"),
+        Message::PvtRate(20)
+    );
+    assert_eq!(parse_body("PQTMCFGMSGRATE,OK,PQTMPVT"), Message::Malformed);
+    assert_eq!(
+        parse_body("PQTMCFGMSGRATE,OK,PQTMPVT,256,1"),
+        Message::Malformed
+    );
+    // other messages keep their plain reply
+    assert!(matches!(
+        parse_body("PQTMCFGMSGRATE,OK,PQTMEPE,1,2"),
+        Message::PqtmReply(PqtmReply { error: None, .. })
+    ));
+    assert_eq!(
+        parse_body("PQTMCFGMSGRATE,ERROR,1"),
+        Message::PqtmReply(PqtmReply {
+            command: PqtmCommand::CfgMsgRate,
+            error: Some(1)
+        })
+    );
+}
+
+#[test]
+fn set_and_read_the_pvt_rate_through_the_driver() {
+    let fake = Fake::default().responder(|line| {
+        let reply = if line.contains(",R,PQTMPVT") {
+            frame("PQTMCFGMSGRATE,OK,PQTMPVT,3,1")
+        } else {
+            answer(line)
+        };
+        lines(&[SPEC_GGA, &reply])
+    });
+    let mut gnss = Lc76g::new(fake.clone());
+    run(gnss.command(&Command::SetPvt { rate: 3 })).unwrap();
+    assert_eq!(run(gnss.pvt_rate()), Ok(3));
+    assert_eq!(
+        fake.written(),
+        [
+            "$PQTMCFGMSGRATE,W,PQTMPVT,3,1*1E",
+            "$PQTMCFGMSGRATE,R,PQTMPVT,1*04"
+        ]
+    );
+    let mut blocking = blocking::Lc76g::new(fake);
+    assert_eq!(blocking.pvt_rate(), Ok(3));
+}
+
+#[test]
+fn a_refused_pvt_command_is_rejected() {
+    let fake = Fake::default().responder(|_| lines(&[&frame("PQTMCFGMSGRATE,ERROR,1")]));
+    let mut gnss = Lc76g::new(fake);
+    assert_eq!(
+        run(gnss.command(&Command::SetPvt { rate: 1 })),
+        Err(Error::Rejected {
+            command: CommandId::Pqtm(PqtmCommand::CfgMsgRate),
+            code: 1
+        })
+    );
+}
+
+fn init_bodies(config: &Config) -> Vec<String> {
+    let fake = Fake::default().responder(friendly);
+    let mut gnss = Lc76g::new(fake.clone());
+    run(gnss.init(config, &mut Recorder::default())).unwrap();
+    fake.written()
+        .iter()
+        .map(|l| {
+            l.trim_start_matches('$')
+                .split('*')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+#[test]
+fn init_sends_the_pvt_rate_only_when_it_is_on() {
+    let off = init_bodies(&Config::default());
+    assert_eq!(off.len(), 14);
+    assert!(off.iter().all(|b| !b.contains("PVT")));
+    assert_eq!(
+        off,
+        [
+            "PQTMVERNO",
+            "PAIR050,1000",
+            "PAIR062,0,1",
+            "PAIR062,1,1",
+            "PAIR062,2,1",
+            "PAIR062,3,1",
+            "PAIR062,4,1",
+            "PAIR062,5,1",
+            "PAIR062,6,0",
+            "PAIR062,7,0",
+            "PAIR062,8,0",
+            "PAIR062,9,0",
+            "PQTMCFGMSGRATE,W,PQTMEPE,0,2",
+            "PAIR080,0",
+        ]
+    );
+    let on = init_bodies(&Config {
+        pvt_rate: 5,
+        ..Config::default()
+    });
+    let mut expected = off.clone();
+    expected.insert(13, "PQTMCFGMSGRATE,W,PQTMPVT,5,1".to_owned());
+    assert_eq!(on, expected);
+}
+
+#[test]
+fn config_pvt_rate_defaults_to_off_and_is_validated() {
+    assert_eq!(Config::default().pvt_rate, 0);
+    assert_eq!(Config::with_fix_interval(100).pvt_rate, 0);
+    let base = Config::with_fix_interval(100);
+    for rate in 0..=20 {
+        assert!(
+            Config {
+                pvt_rate: rate,
+                ..base
+            }
+            .is_valid(),
+            "{rate}"
+        );
+    }
+    assert!(
+        !Config {
+            pvt_rate: 21,
+            ..base
+        }
+        .is_valid()
+    );
+    assert!(
+        !Config {
+            pvt_rate: 255,
+            ..Config::default()
+        }
+        .is_valid()
+    );
+    // every sentence on at 10 Hz (GSA, GSV, GRS once a second) is valid without PVT and over the
+    // byte budget with PVT at one per fix; thinned out PVT or fewer sentences fit
+    let all = Config {
+        rates: SentenceRates {
+            gga: 1,
+            gll: 1,
+            gsa: 10,
+            gsv: 10,
+            rmc: 1,
+            vtg: 1,
+            zda: 1,
+            grs: 10,
+            gst: 1,
+            gns: 1,
+        },
+        epe: false,
+        ..base
+    };
+    assert!(all.is_valid());
+    assert!(!Config { pvt_rate: 1, ..all }.is_valid());
+    assert!(
+        Config {
+            pvt_rate: 10,
+            ..all
+        }
+        .is_valid()
+    );
+    // the 10 Hz flight set with PVT at every fix fits
+    assert!(
+        Config {
+            pvt_rate: 1,
+            epe: true,
+            ..base
+        }
+        .is_valid()
+    );
+    // below the budget, nothing is checked for pvt_rate 0 even with every rate at its maximum
+    assert!(
+        Config {
+            rates: SentenceRates {
+                gga: 1,
+                gll: 1,
+                gsa: 20,
+                gsv: 20,
+                rmc: 1,
+                vtg: 1,
+                zda: 1,
+                grs: 20,
+                gst: 1,
+                gns: 1
+            },
+            ..base
+        }
+        .is_valid()
+    );
+    // 1 Hz with everything on and PVT is far below the budget
+    assert!(
+        Config {
+            pvt_rate: 1,
+            rates: all.rates,
+            ..Config::default()
+        }
+        .is_valid()
+    );
+    // init refuses an over-budget configuration before sending anything
+    let fake = Fake::default().responder(friendly);
+    let mut gnss = Lc76g::new(fake.clone());
+    assert_eq!(
+        run(gnss.init(&Config { pvt_rate: 1, ..all }, &mut Recorder::default())),
+        Err(Error::InvalidConfig)
+    );
+    assert!(fake.written().is_empty());
+}
+
+fn pvt_line(time: &str) -> String {
+    let body = PVT_BODY.replace("064320.800", time);
+    frame(&body)
+}
+
+#[test]
+fn pvt_does_not_change_when_or_what_fix_is_delivered() {
+    let rmc = "$GNRMC,120000.000,A,0112.345678,N,00234.567890,E,0.250,90.50,111126,,,A,V*0F";
+    let gga = "$GNGGA,120000.000,0112.345678,N,00234.567890,E,1,12,0.60,10.500,M,-17.000,M,,*62";
+    let pvt = pvt_line("120000.000");
+    let plain = [gga, SPEC_GSA, rmc, SPEC_VTG];
+    let with_pvt = [gga, SPEC_GSA, rmc, pvt.as_str(), SPEC_VTG];
+    let first = |stream: &[&str]| {
+        let mut gnss = Lc76g::new(Fake::with_stream(&lines(stream)));
+        let fix = run(gnss.read_fix()).unwrap();
+        (fix, gnss.stats())
+    };
+    let (a, sa) = first(&plain);
+    let (b, sb) = first(&with_pvt);
+    assert_eq!(a, b);
+    assert_eq!((sa.overflows, sb.overflows), (0, 0));
+    // the fix is complete at its RMC: the PVT after it has not been read yet
+    let mut gnss = Lc76g::new(Fake::with_stream(&lines(&with_pvt)));
+    run(gnss.read_fix()).unwrap();
+    assert_eq!(gnss.stats().sentences, 3);
+    // read() hands the PVT over as a message, with the time to pair it by
+    let mut messages = Vec::new();
+    let mut gnss = Lc76g::new(Fake::with_stream(&lines(&with_pvt)));
+    for _ in 0..with_pvt.len() {
+        messages.push(run(gnss.read()).unwrap());
+    }
+    let pvt = pvt_of(messages[3]);
+    assert_eq!(pvt.time.map(|t| t.millis_of_day()), Some(12 * 3_600_000));
+    assert_eq!(gnss.stats().overflows, 0);
+}
+
+#[test]
+fn pvt_of_bench_length_is_not_an_overflow_for_the_driver() {
+    let pvt = pvt_line("064320.800");
+    assert!(pvt.len() > 128);
+    let mut gnss = Lc76g::new(Fake::with_stream(&lines(&[&pvt, SPEC_GLL])));
+    assert!(matches!(run(gnss.read()).unwrap(), Message::Pvt(_)));
+    assert!(matches!(run(gnss.read()).unwrap(), Message::Gll(_)));
+    assert_eq!(gnss.stats().overflows, 0);
+}

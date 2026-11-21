@@ -1,5 +1,7 @@
 //! Module settings applied by [`Lc76g::init`](crate::Lc76g::init): [`Config`] and its parts.
 
+use crate::nmea::MAX_SENTENCE_LEN;
+
 /// Position fix interval limits of `PAIR050`, in milliseconds.
 pub const FIX_INTERVAL_MS: core::ops::RangeInclusive<u16> = 100..=1000;
 /// Largest sentence output rate of `PAIR062` (one sentence every N fixes).
@@ -203,6 +205,11 @@ pub struct Config {
     pub rates: SentenceRates,
     /// Output `$PQTMEPE` (estimated position error) every fix (default off).
     pub epe: bool,
+    /// Output `$PQTMPVT` (position, velocity, time) once per this many fixes, 1 to 20; 0 (default)
+    /// means [`Lc76g::init`](crate::Lc76g::init) sends nothing about it, so the module's own setting
+    /// (off at power-on) stays. When not 0 the stream must also fit the line, see
+    /// [`Config::is_valid`].
+    pub pvt_rate: u8,
     /// PPS setting; `None` leaves the module's PPS as it is (the specification gives no default pulse
     /// type).
     pub pps: Option<Pps>,
@@ -215,10 +222,26 @@ impl Default for Config {
             nav_mode: NavMode::Normal,
             rates: SentenceRates::default(),
             epe: false,
+            pvt_rate: 0,
             pps: None,
         }
     }
 }
+
+/// Bytes per second the line carries at 115200 baud 8N1 (10 bits per byte).
+const LINE_BYTES_PER_S: u32 = 11_520;
+/// Share of the line the stream may use when `$PQTMPVT` is on, in percent. The rest is left for command
+/// replies and bursts.
+const STREAM_BUDGET_PERCENT: u32 = 80;
+/// Upper bound of one NMEA sentence of the standard types with CR LF, in bytes: the longest are about
+/// 85 bytes plus the two line-end bytes (see [`MAX_SENTENCE_LEN`]), taken as 92. An estimate from the
+/// field widths, not a measurement.
+const NMEA_LINE_BYTES: u32 = 92;
+/// `$PQTMPVT` at its maximum length ([`MAX_SENTENCE_LEN`]) plus CR LF.
+const PVT_LINE_BYTES: u32 = MAX_SENTENCE_LEN as u32 + 2;
+/// Sentences one epoch can hold per type, in [`SentenceType::ALL`] order: GSA about 4 (one per
+/// constellation), GSV about 12, GRS about 4, the others one.
+const SENTENCES_PER_EPOCH: [u32; 10] = [1, 1, 4, 12, 1, 1, 1, 4, 1, 1];
 
 impl Config {
     /// [`Config::default`] with `fix_interval_ms` and GSA and GSV at `ceil(1000 / ms)`, the smallest rate
@@ -249,6 +272,14 @@ impl Config {
     /// rates) and the module does not thin them by itself: at 100 ms with the default rates it sends 187
     /// sentences, 11.58 kB per second, more than the 11.52 kB/s of 115200 baud. With GSA and GSV at 10
     /// it sends about 65 sentences per second.
+    ///
+    /// `pvt_rate` must be 0 to 20. When it is not 0 there is a second rule, a byte budget: the
+    /// enabled sentence types at their upper-bound sizes (92 bytes with CR LF, up to 4 GSA, 12 GSV and
+    /// 4 GRS per epoch) plus `$PQTMPVT` at [`MAX_SENTENCE_LEN`] + 2 bytes, per second at the configured
+    /// interval, must not exceed 80 % of the 11520 bytes per second of the line. The sizes of the
+    /// standard sentences are estimates; only `$PQTMPVT` (about 138 bytes, once per fix) was measured.
+    /// With `pvt_rate` 0 the rule is not applied, so a configuration valid before `pvt_rate` existed
+    /// stays valid.
     pub fn is_valid(&self) -> bool {
         let ms = u32::from(self.fix_interval_ms);
         FIX_INTERVAL_MS.contains(&self.fix_interval_ms)
@@ -262,5 +293,28 @@ impl Config {
                     ms >= 1000 || rate == 0 || rate * ms >= 1000
                 })
             && self.pps.is_none_or(|p| PPS_WIDTH_MS.contains(&p.width_ms))
+            && self.pvt_rate <= MAX_SENTENCE_RATE
+            && (self.pvt_rate == 0
+                || self.stream_bytes_per_s() <= LINE_BYTES_PER_S / 100 * STREAM_BUDGET_PERCENT)
+    }
+
+    /// Upper bound of the bytes per second of the enabled sentences including `$PQTMPVT`.
+    fn stream_bytes_per_s(&self) -> u32 {
+        let ms = u32::from(self.fix_interval_ms).max(1);
+        let per_second = |rate: u8| 1000u32.div_ceil(ms * u32::from(rate.max(1)));
+        let standard: u32 = SentenceType::ALL
+            .iter()
+            .zip(SENTENCES_PER_EPOCH)
+            .map(|(s, count)| match self.rates.get(*s) {
+                0 => 0,
+                rate => per_second(rate) * count * NMEA_LINE_BYTES,
+            })
+            .sum();
+        let epe = if self.epe {
+            per_second(1) * NMEA_LINE_BYTES
+        } else {
+            0
+        };
+        standard + epe + per_second(self.pvt_rate) * PVT_LINE_BYTES
     }
 }

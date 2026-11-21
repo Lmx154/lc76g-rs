@@ -59,6 +59,15 @@ Pins: see "Pins and bus" below.
   VelE mean -0.6, sd 13.8, -41 to 34; VelD mean -0.5, sd 0.7, -3 to 0; Spd 1 to 45; Heading held at one value.
   The sign of VelD and its response to vertical motion are not checked (needs a lift-and-lower test).
 - Load at 5 Hz: about 690 bytes/s more (2.0 kB/s with, 1.3 kB/s without, of 11.5 kB/s), 24 sentences/s instead of 19.
+- The specification's field list has 19 fields after the address (`MsgVer` to `PDOP`), as does the bench sentence.
+- Driver support (this revision): `MAX_SENTENCE_LEN` is 160 (worst case from the field widths 155 bytes: `$PQTMPVT,` 9, fields 125, commas 18,
+  `*CS` 3; measured 134 to 137), `Message::Pvt` decodes version 1 (another version is `Message::PvtUnsupportedVersion`),
+  `Command::SetPvt { rate }` / `Command::GetPvtRate` send `$PQTMCFGMSGRATE,W,PQTMPVT,<rate>,1` and `,R,PQTMPVT,1`,
+  `Config::pvt_rate` (default 0: `init` sends nothing about PVT) and `Lc76g::pvt_rate()` read the rate back. Velocities decode to
+  signed mm/s, heading to 0.01 degree, position to 1e-7 degree. `HDOP` and `PDOP` of 99.99 (invalid) stay 9999. `read_fix` is
+  unchanged: the PVT follows the RMC by about 16 ms, after the fix is complete, so it is handed over as its own message and the
+  caller pairs it by time. Verified only on made-up sentences (host tests); not yet run through the driver on the module.
+- Sign of `VelD`: unverified, see above; the decoder does not change it.
 
 ## Pins and bus (from pinout.md)
 
