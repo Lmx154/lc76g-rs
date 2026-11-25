@@ -1,12 +1,19 @@
 # lc76g
 
-Driver for the Quectel LC76G GNSS module over a UART, written for the MARV V2 Rev 1 flight controller. The crate is `no_std` and has three layers. The NMEA framer (`Framer`), the sentence decoders (`Sentence::parse`), the fix builder (`FixBuilder`) and the command encoder (`Command::write`) work on bytes and need no I/O at all. On top of them, `Lc76g` drives a UART through the `embedded-io-async` traits, and `blocking::Lc76g` does the same through the `embedded-io` traits. The only dependencies are `embedded-io` 0.7, `embedded-io-async` 0.7, `embedded-hal` 1.0, `embedded-hal-async` 1.0 and, optionally, `defmt`.
+Driver for the Quectel LC76G GNSS module over a UART, written for the MARV V2 Rev 1 flight controller. The crate is `no_std` with three layers: byte-level pieces that need no I/O (the NMEA `Framer`, the sentence decoders `Sentence::parse`, the fix builder `FixBuilder`, the command encoder `Command::write`), `Lc76g` over the `embedded-io-async` traits, and `blocking::Lc76g` over the `embedded-io` traits. Dependencies: `embedded-io` 0.7, `embedded-io-async` 0.7, `embedded-hal` 1.0, `embedded-hal-async` 1.0 and optionally `defmt`. Version 0.1.0; the API may still change. No embassy crate is needed.
 
-**Status: version 0.1.0, prepared for crates.io. The API may still change.** It has been exercised on one board and one module firmware; see "Not covered and not verified".
-
-## Works with
-
-The driver works with any HAL and any MCU whose UART implements `embedded-io-async` 0.7 (async driver) or `embedded-io` 0.7 (`blocking::Lc76g`). The framer, decoders and encoder need no I/O at all. No embassy crate is needed.
+```mermaid
+flowchart LR
+  uart["UART<br/>embedded-io (async or blocking)"] --> drv["Lc76g#lt;UART#gt;"]
+  subgraph core["sans-IO core"]
+    fr["Framer"] --> sp["Sentence::parse"] --> fb["FixBuilder"]
+    cmd["Command::write"]
+  end
+  drv --> fr
+  fb --> fix["Fix (GGA + RMC)"]
+  sp --> msg["Message (GSA, GSV, PVT, ...)"]
+  drv --> cmd --> uart
+```
 
 ## Quick start
 
@@ -49,7 +56,7 @@ let malformed = "$GNGGA,120000.000,01x2.345678,N,00234.567890,E,1,12,0.60,10.500
 assert_eq!(Sentence::new(malformed).unwrap().parse(), Message::Malformed);
 ```
 
-The driver on a UART. Here a scripted UART stands in for the hardware; on the board the UART is the one described below, and `init(&Config, &mut delay)` (not run here) would follow `version`.
+The driver on a UART. Here a scripted UART stands in for the hardware; on the board `init(&Config, &mut delay)` (not run here) would follow `version`. The full on-board sequence is in `hil/src/bin/lc76g_smoke.rs`.
 
 ```rust
 # use core::convert::Infallible;
@@ -95,106 +102,38 @@ assert_eq!(gps.stats().fixes, 1);
 # });
 ```
 
-On the board (UART1, PPS, timeouts, the full sequence) see `hil/src/bin/lc76g_smoke.rs`.
+## Docs
 
-## What the application provides
-
-- A UART at 115200 baud, 8N1 (the default in the rustdoc, and what `lc76g_smoke` uses). The async driver needs `embedded_io_async::Read`, plus `Write` to send commands; `blocking::Lc76g` needs `embedded_io::Read` and `Write`. Receive-only wiring works for `read_sentence`, `read` and `read_fix`.
-- A buffered UART: the module sends bursts of about 20 sentences (1.4 kB, 120 ms at 115200 baud), which a UART with a one-byte FIFO would overrun (rustdoc).
-- With embassy-rp 0.10 the on-board program uses `embassy_rp::uart::BufferedUart` (interrupt driven, `BufferedInterruptHandler`) as the UART of `Lc76g`, with a 4096-byte receive and a 256-byte transmit buffer.
-- Timeouts. The driver owns no timer, pin or task; the caller lends a delay to `init` (`embedded_hal_async::delay::DelayNs`, or `embedded_hal::delay::DelayNs` for `blocking::Lc76g`), used only for the fix-interval hold below. On a silent line `read*` waits forever; wrap calls in the executor's timeout (async), or give the UART a read timeout (blocking).
-- A delay for `init`. When the configured fix interval is not 1000 ms, `init` waits `FIX_INTERVAL_SETTLE_MS` (500 ms) with it before its last command; at 1000 ms it is never used. The blocking driver waits with the blocking delay inside the call.
-- The PPS pin and its time-stamping. The driver does not touch it. `Command::SetPps` configures the module's pulse.
-
-## Rules for correct use
-
-- **Two fix-interval commands restart the module.** Measured 2026-11-20 on `LC76GABNR12A05S`: when the first `$PAIR050` really changes the rate and a second follows soon after, the module answers `$PAIR001,050,1` (being processed), sends nothing more, restarts by itself about 1.8 s later and comes back at its stored settings (1 Hz, stored sentence set). Spacing from the first acknowledgement to the second send: 18, 26, 46, 47, 50, 70, 120 and 170 ms restarted it (8 of 8); 207, 271, 370, 470, 519, 771 and 970 ms were accepted (7 of 7); 97 ms was accepted once. A resend does not help. After every applied change the module sends an unsolicited `$PAIR001,124,0` 114 to 241 ms after the acknowledgement. `init` therefore holds `FIX_INTERVAL_SETTLE_MS` = 500 ms (about three times the latest restart seen, twice the latest `124` message) before its last fix-interval command, using the delay it is given. `command` does not enforce this: a caller sending `Command::SetFixInterval` itself waits at least that long between two.
-- **Right after power-on a fix-interval change does not complete, and the interval can survive a power-off.** Measured 2026-11-20 on `LC76GABNR12A05S` (three power-ons after 22 to 47 s without power, on a board that feeds the module's backup supply): the module came up at the 200 ms interval set before the power-off, with its default sentence set, and answered the version query in 11 ms; `$PAIR050,1000` sent about 0.1 s after its first sentence got `$PAIR001,050,1`, then `$PAIR001,124,0` and `$PAIR011,001` at about 240 ms, and no final result within 100 sentences (about 1.5 s), so `init` returned `Error::NoAck` and the interval stayed unchanged. The same `init` 5 s later succeeded every time. Call `init` again after a failure; do not assume the module starts at 1000 ms.
-- **No panics on module input.** Malformed input is an error value (`Message::Malformed`, `None`, a counted checksum error or overflow). `src/lib.rs` carries a `deny` block of clippy lints (`unwrap_used`, `expect_used`, `panic`, `unreachable`, `todo`, `unimplemented`, `indexing_slicing`) outside tests; they are enforced when `cargo clippy` runs, which is part of this repository's checks. `forbid(unsafe_code)` is enforced by the compiler. `src/fuzz_tests.rs` holds the property tests. This is lints plus randomised tests, not a proof; the lint block does not cover arithmetic overflow.
-- **Dropped reads.** The rustdoc says: dropping a `read*` or `command` future loses nothing the driver already read; a command write cut short may leave a partial sentence on the wire, which the module discards by its checksum. The test `dropping_a_read_future_loses_nothing` (`src/tests.rs`) covers a dropped read. With the blocking driver, a UART read timeout comes out as `Error::Uart` and nothing read is lost.
-- **Commands.** `command` returns `Ok(())` when the module acknowledges (`$PAIR001,<id>,0` for PAIR commands, `OK` for PQTM commands; a "being processed" result keeps waiting), `Err(Error::Rejected { command, code })` when it refuses, and `Err(Error::NoAck)` after `ACK_SENTENCE_LIMIT` (100) other sentences without the acknowledgement. On a silent line it waits forever. A `Command::Raw` whose reply is not known returns once sent. **Abandoned commands.** An acknowledgement is matched by command number only, so the driver keeps a private mark that an exchange is open: set before the first byte of a command is written, cleared when the exchange has read its own acknowledgement (accepted or rejected). It stays set when the `command` future is dropped (for example by a timeout), after `Err(Error::NoAck)` and after a UART error. The next `command` (also `version`, `init`, `save_settings`) then first resynchronises: it sends a line end and a read-only query, `$PAIR051`, `$PAIR081` or `$PQTMVERNO` (the first whose number is neither the abandoned command's nor the new command's; none changes a setting or writes the module's flash), and discards sentences, at most `ACK_SENTENCE_LIMIT`, up to the query's answer, so a late acknowledgement of the abandoned command is not taken for the answer to the next one. If the query gets no answer the call returns `Err(Error::NoAck)` without sending the command, and the next call tries again. With the mark clear the driver sends exactly the command bytes, nothing more. This assumes that the module answers commands in the order it received them; that is not verified in this revision. If a resynchronisation is itself cut short or ends in `NoAck`, the driver remembers its query and the next attempt uses another one (also different from the abandoned and the new command), so the late answer of the first query cannot end the second resynchronisation early. What remains: when the caller's own commands are two of the three queries there is no other candidate and the same query is used again, and the driver remembers only the last unanswered query, so after two unfinished resynchronisations in a row the third can choose the first query again; in both cases a late answer of an earlier query can end a resynchronisation early, and the answer to its query can then arrive after the call and be taken for the answer to a later call of that query command (`$PAIR051`, `$PAIR081` or `$PQTMVERNO`).
-- **Fixes seen during `command`** are discarded and counted in `Stats::fixes_discarded`.
-- **Stored configuration and restarts.** `init` never writes the module's flash; settings are volatile until power loss or reset. `Command::SaveSettings` (`$PAIR513`) writes the module's flash and `Command::SavePqtm` (`$PQTMSAVEPAR`) its NVDM; `Lc76g::save_settings` sends both. `Command::Start` (`Hot`, `Warm`, `Cold`, `FullCold` = `$PAIR004` to `$PAIR007`) restarts the GNSS engine, and `FullCold` also resets the module to factory settings. The rustdoc notes that above 1 Hz the specification requires powering the GNSS system off (`$PAIR382,1`, `$PAIR003`) before `$PAIR513` and on again (`$PAIR002`) after; `save_settings` does not do this. `Command::Raw` can send any sentence body, including these, provided the body is non-empty, at most 156 bytes (`MAX_SENTENCE_LEN` - 4; 124 before the limit was raised to 160), printable ASCII and free of `$` and `*`; otherwise `Error::InvalidCommand` is returned and nothing is sent.
-- **Other error values.** `Error::Eof`: the UART returned zero bytes from a read or a write (the line is closed). `Error::InvalidConfig`: `init` found a `Config` with a value outside the accepted range, or one that breaks the stream budget; nothing was sent. `Error::InvalidCommand`: a `Command::Raw` body that cannot be framed (above); nothing was sent.
-- **`init` is not atomic.** It checks the configuration, queries the version, sets the 1000 ms interval, then the sentence rates and the other settings, and the target interval last. An error part-way leaves the module partly configured and at 1 Hz; call `init` again.
-- **`release()`** returns the UART; bytes already read from it but not yet consumed by the driver are lost.
-
-## What the driver does
-
-Decoded sentences, as `Message` variants (new in this revision: GNS, ZDA, GST, GRS):
-
-| Sentence | Yields |
+| Page | In one line |
 |---|---|
-| GGA | time, position, quality, satellites used, HDOP, altitude, geoid separation |
-| RMC | time, date, validity, position, speed, course, mode |
-| GSA | fix type, PDOP/HDOP/VDOP, up to 12 satellite IDs, system ID |
-| GSV | up to four satellites (ID, elevation, azimuth, C/N0) per sentence |
-| VTG, GLL | course and speed; position, time, validity |
-| **ZDA** (new) | time, date, local zone hour and minute (the module leaves the zone empty); `utc_unix_ms()` |
-| **GNS** (new) | time, position, one mode letter per constellation, satellites used, HDOP, altitude, geoid separation |
-| **GST** (new) | standard deviations (RMS, ellipse axes, orientation, lat, lon, altitude), mm |
-| **GRS** (new) | mode and twelve range residuals, mm; optional system and signal ID |
-| `$PAIR001` | acknowledgement of a PAIR command (`Ack`) |
-| `$PQTMVERNO`, `$PQTMEPE` | firmware version; estimated position error (N, E, D, 2D, 3D, mm) |
-| **`$PQTMPVT`** (new) | message version 1: GPS time of week, UTC date and time, quality, fix mode, satellites used, leap seconds, position, altitude, geoid separation, velocity north / east / down (mm/s, signed), ground speed, heading (0.01 degree), HDOP and PDOP. Another message version is `Message::PvtUnsupportedVersion`. **The sign of the down velocity is not verified on the module.** |
-| `$PQTMCFGMSGRATE,OK,PQTMPVT,<rate>[,1]` | answer to a read of the PVT rate (`Message::PvtRate`) |
-| `$PQTM...,OK/ERROR` | reply to a PQTM command |
+| [docs/driver.md](docs/driver.md) | What the application provides, rules for correct use (fix-interval restarts, commands, `init`), errors, not covered |
+| [docs/sentences.md](docs/sentences.md) | Decoded sentences, framer, fix builder, units, commands, `$PQTMPVT` |
+| [docs/device.md](docs/device.md) | Module facts: protocol, default stream, 10 Hz budget, PPS, pins, specification |
+| [hil/README.md](hil/README.md) | On-board test programs and how to run them |
 
-`Message::Other` is any valid sentence not listed. `Message::Malformed` is a valid checksum with fields that do not fit the layout. A field the module leaves empty decodes to `None`.
+## Status
 
-- **Framer.** Bytes in any chunking; a sentence is returned when its line ends and its checksum is right. It resynchronises on `$`. `Framer::stats()` counts sentences, checksum errors (including sentences cut off by the next `$`) and overflows (longer than `MAX_SENTENCE_LEN` = 160 bytes, from `$` to the last checksum digit; derived from the field widths of `$PQTMPVT`, the longest sentence: 155 bytes in the worst case, 134 to 137 measured; before this revision it was 128 and every PVT was dropped as an overflow). `Lc76g::stats()` adds fixes, dropped epochs and discarded fixes; counters saturate.
-- **Fix builder.** A `Fix` is made when the GGA and RMC of the same UTC time have both arrived. It holds time, date, `valid` (RMC status), quality, `lat_e7`, `lon_e7`, `alt_mm`, `geoid_sep_mm`, `speed_mm_s`, `course_cdeg`, `sats_used`, `hdop_x100`, and from the latest GSA `fix_type`, `pdop_x100`, `vdop_x100` (up to a second older above 1 Hz; `None` before a GSA). A mismatched epoch is dropped and counted.
-- **Units.** Integers: 1e-7 degree, mm, mm/s, 0.01 degree, DOP x100. `units` and `Fix::lat_deg` and similar convert to floating point.
-- **Commands** (`Command`): version query, fix interval (100 to 1000 ms), sentence rate per type, rate reset, navigation mode, PPS, start types, EPE on/off, `$PQTMPVT` rate set (`SetPvt`) and read (`GetPvtRate`, `Lc76g::pvt_rate()`), save, `Raw`. `Config` and `init` apply a full set; `init` refuses a configuration that breaks the stream budget (below 1000 ms, GSA, GSV and GRS at most once per second; `Config::with_fix_interval` sets rates that fit). `Config::pvt_rate` (0 = not requested, the default: `init` sends nothing about PVT, so a PVT output enabled earlier stays on; 1 to 20 = every N-th fix) makes `init` send `$PQTMCFGMSGRATE,W,PQTMPVT,<rate>,1` after the EPE setting. With a PVT rate set, `Config::is_valid` also applies a byte budget: the enabled sentences at upper-bound sizes (92 bytes with CR LF for the standard ones, estimates; PVT at 162 bytes, its maximum length plus CR LF) per second at the fix interval must stay within 80 % of the 11520 bytes/s of the line. Every sentence on at 10 Hz fits without PVT and not with PVT at every fix; the 10 Hz flight set with PVT at every fix fits. With `pvt_rate` 0 this rule is not applied.
-- **PVT and the fix.** `Fix` does not carry the PVT. On the module the PVT arrives about 16 ms after the RMC of its epoch, that is after `FixBuilder` has completed the fix at the RMC, and the driver does not delay a fix to wait for it. `read_fix` therefore returns the same fix with PVT on or off and skips the PVT sentence; `Lc76g::read` (or the sans-IO `Sentence::parse`) returns it as `Message::Pvt`, to be paired with the fix of the same epoch by `Pvt::time` (equal to the RMC time of the epoch, 100 of 100 on the bench).
-- **Blocking front-end.** `blocking::Lc76g` runs the same code over blocking `embedded-io` traits.
+- Host tests: `cargo test --locked` (unit tests, property tests in `src/fuzz_tests.rs`, doctests). Property tests feed arbitrary bytes in arbitrary chunks to the framer and the driver, arbitrary text to every field parser, check-summed sentences around random fields, and arbitrary replies to the command layer.
+- On the board (MARV V2 Rev 1, UART1 and PPS, one module firmware `LC76GABNR12A05S`): smoke, aux, stream and resync programs; see [hil](hil/README.md).
+- Not verified on the module: `$PQTMPVT` decoded through this driver, the sign of the down velocity, reading through a DMA UART, a second module firmware; see [driver](docs/driver.md).
+- Cargo feature `defmt` (off by default): `defmt::Format` on public types and `embedded-io/defmt`, `embedded-io-async/defmt`.
 
-## Not covered and not verified
+## Used by
 
-Not implemented: any sentence outside the table (RLM, other PAIR and PQTM replies decode to `Other`); binary protocols; typed read-back of settings (the on-board program reads them through `Command::Raw` and looks at the text); baud-rate change and constellation selection (`Config` documents both as excluded because the module restarts); the module's EPE merged into `Fix`; time synchronisation from PPS; recovery of a module left flooded by other software. Further module features (jamming status, SBAS, elevation mask, low power, geofence, logging) have no `Command` variant. The earlier version of this README (2026-11-10) recorded one `NoAck` from `init` with the default configuration while the module was running at 10 Hz; it did not happen again in the 16 runs on the final code, and the cause was not found.
+Standalone: the current MARV V2 firmware does not use this crate.
 
-Not verified on the real module:
+## MARV project
 
-- **GNS, ZDA, GST, GRS.** `lc76g_smoke` never examines a decoded GNS, ZDA, GST or GRS (it switches ZDA on for a moment and then checks that all four are absent after `init(&Config::default())`). `lc76g_aux` does (2026-11-11, one run): ZDA 10 of 10, GST 10 of 10, GRS 40 of 40 and GNS 10 of 10 decoded and cross-checked against RMC, GGA and GSA, with no mismatch.
-- **GNS layout.** The module sends the standard NMEA layout: 13 fields, no unit fields, a mode indicator of 6 characters (`AAAANN` on the bench). The decoder accepts that layout and the 14 or 15 field layout of the manufacturer's example (unit fields `M` or empty after the altitude and the geoid separation), told apart by the field count; any other count is `Message::Malformed`. Only the 13-field layout has been seen from the real module (firmware `LC76GABNR12A05S`). The mode letters `P` and `S` are rejected; only `A D E F M N R` are accepted.
-- **`$PQTMPVT`.** Measured once (2026-11-21, `lc76g_pvt`, 100 sentences, 0 malformed) with the program's own framer, before the driver decoded it; no on-board program decodes it with this driver yet. The sign of the down velocity and its response to vertical motion are not checked: only a board at rest was measured. Fix pairing is by time stamp in the caller (see above). The PVT stream budget uses estimated sizes for the standard sentences.
-- Reading through a DMA UART has not been tried.
-- Only one firmware was used: `LC76GABNR12A05S`.
+| Repository | Role |
+|---|---|
+| [MARV-FC](https://github.com/Lmx154/MARV-FC) | Flight-controller firmware for the MARV V2 board (RP2350B) |
+| [MARV-GCS](https://github.com/Lmx154/MARV-GCS) | Ground station (`marv-gcs`) and command line (`marv-cli`) |
+| [MARV-sim](https://github.com/Lmx154/MARV-sim) | Simulator that runs the firmware's flight code |
+| Sensors | [icm45686](https://github.com/Lmx154/icm45686-rs) · [lsm6dsk320x](https://github.com/Lmx154/lsm6dsk320x-rs) · [bmp581](https://github.com/Lmx154/bmp581-rs) · [bmm350](https://github.com/Lmx154/bmm350-rs) · [sam-m10q](https://github.com/Lmx154/sam-m10q) · [adc-battery](https://github.com/Lmx154/adc-battery) |
+| Board I/O | [pio-sdmmc](https://github.com/Lmx154/pio-sdmmc-rs) · [qmi-psram](https://github.com/Lmx154/qmi-psram-rs) · [ws2812c](https://github.com/Lmx154/ws2812c-rs) · [usb-cdc](https://github.com/Lmx154/usb-cdc) · [pio-uart](https://github.com/Lmx154/pio-uart) |
+| Motors and links | [dshot](https://github.com/Lmx154/dshot-rs) · [esc-passthrough](https://github.com/Lmx154/esc-passthrough) · [rc-port](https://github.com/Lmx154/rc-port) · [crsf-codec](https://github.com/Lmx154/crsf-codec) · [mavlink-device](https://github.com/Lmx154/mavlink-device) · [marv-dialect](https://github.com/Lmx154/marv-dialect) |
+| Other drivers | **lc76g** (Quectel LC76G GNSS) |
 
-## Measured on the MARV V2 Rev 1 board
-
-From `docs/device.md` (bench module `LC76GABNR12A05S`, RP2350 at 150 MHz) unless noted.
-
-- 115200 baud 8N1 confirmed. Default stream: GGA, GLL, GSA, GSV, RMC, VTG every fix; ZDA, GRS, GST, GNS off.
-- 100 ms fix interval with default rates: 187 sentences, 11.6 kB per second (the line carries 11.52 kB/s); fixes drop (97 per 10 s) and commands are answered a second late or never. With GSA and GSV at 10: 100 fixes per 10 s, about 65 sentences per second, replies in milliseconds.
-- At 10 Hz, about 57 of 99 fix-time steps are exactly 100 ms, the rest 89 to 107 ms, rarely up to 172 ms.
-- `read_fix` returns the fix of a second 75 to 90 ms after the PPS edge. PPS period: 1 s to 5 ppm by the MCU timer, one period 1 to 3 ms off in about half the runs (cause undecided).
-- Framing one GGA 49 us; framing and parsing 115 us (RMC: 46 us and 116 us).
-- `Lc76g<BufferedUart>` is 440 bytes plus the UART buffers (measured with the 128-byte framer; the 160-byte framer adds 32 bytes, and the command buffers on the stack of `command` grow by 32 bytes each, to 164 and 162 bytes).
-- Drone mode: six decimals of minutes in coordinates; the decoders accept six or seven.
-
-## Tests
-
-- Host: `cargo test --locked` runs 106 unit tests and 2 doc tests (observed on this tree; 90 and 2 before `$PQTMPVT` support). Property tests (14, plus one regression test, `src/fuzz_tests.rs`): arbitrary bytes in arbitrary chunks into the framer and the driver; arbitrary and multi-byte text into every field parser and every decoder (including `$PQTMPVT` and the PVT rate answer); check-summed sentences around random fields; arbitrary replies into the command layer.
-- On the board, through a debug probe (probe-rs, chip RP235x; the script takes a lock so runs do not overlap): `tools/run.sh alive`, `tools/run.sh lc76g_smoke` and `tools/run.sh lc76g_aux 150`. The exit status is 0 when every check passed. `lc76g_smoke` checks the version query, `init` at 10 Hz, 100 fixes in 10 s (plus or minus 2), plausible fixes, decode cost, PPS period, the blocking front-end, and the return to default settings.
-- `lc76g_aux` decodes ZDA, GNS, GST and GRS from the real module and cross-checks them against RMC, GGA and GSA (exit 0 when every check passed; positions are printed masked).
-- `tools/run.sh lc76g_stream 170` audits the whole stream: a wrapper around the UART keeps its own tally of every sentence in the raw bytes (by talker and type, with its own checksum test) and compares it with what the driver made of the same sentences. Observed (2026-11-11, one run, with a fix and 24 satellites, 30 s each): default stream at 1 Hz 542 sentences, the 10 Hz configuration 1934, everything on at 1 Hz (with ZDA, GRS, GST, GNS) 755; in all three the driver's count equals the raw count, every sentence of a type the driver decodes was decoded (0 `Malformed`), 0 checksum errors, 0 bytes outside a sentence; at 10 Hz 300 fixes for 300 GGA + RMC pairs. Across sentences of the same epoch: time, position and status agree between GGA, RMC and GLL (360 of 360 epochs), satellites in use equal the GSA slots, RMC and VTG speed differ by at most 4 mm/s, RMC and ZDA dates agree. The only sentence the driver does not decode is a `$PAIR010` status message (2 seen, reported as `Other`). The stream was clean, so the run does not show the audit catching a fault.
-- `lc76g_smoke` documents that it never sends a flash write, a baud change, a restart or a low-power command. In the program the only `Raw` bodies are `PAIR051`, `PAIR063,<n>` and `PAIR081` (get commands), and neither `SaveSettings`, `SavePqtm` nor `Start` appears. It ends with `init(&Config::default())`.
-- `tools/run.sh lc76g_resync 300` exercises abandoned commands on the module. Observed (2026-11-11, two runs): the module answers two back-to-back queries in the order sent (24 of 24 pairs); a command issued right after an abandoned one of the same number returns its own answer (40 of 40, both directions: accepted after rejected and rejected after accepted); the same sequence without the driver's resynchronisation takes the stale answer (24 of 24, so the hazard is real); 10 Hz fixes read under 20 ms timeouts lose nothing (100 of 100, 444 dropped calls). A resynchronisation cost about 10 ms and 4 sentences at 10 Hz; the module's command-to-acknowledgement time was 4.4 ms at best, 5.6 ms median and 93 ms at worst. The program sends only get commands and NMEA output-rate settings for ZDA (some deliberately invalid, which the module rejects), never a flash write, and ends with `init(&Config::default())`.
-
-## Cargo features
-
-| Feature | Default | Effect |
-|---|---|---|
-| `defmt` | off | `defmt::Format` derives on public types; enables `embedded-io/defmt` and `embedded-io-async/defmt` |
-
-## Layout and licence
-
-```text
-src/            the driver (nmea, sentence, aux_sentences, fix, command, config, units, blocking)
-docs/device.md  protocol, timing and measured facts, pins
-hil/            on-board programs (own workspace; the only place that uses embassy-rp)
-tools/run.sh    builds, flashes and runs one on-board program
-```
+## License
 
 MIT, see `LICENSE`.
